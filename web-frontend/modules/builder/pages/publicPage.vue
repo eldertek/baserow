@@ -33,7 +33,13 @@ import {
   getTokenIfEnoughTimeLeft,
   userSourceCookieTokenName,
 } from '@baserow/modules/core/utils/auth'
-import { useHead, useRequestURL, useRoute, useRuntimeConfig } from '#imports'
+import {
+  useHead,
+  useRequestURL,
+  useResponseHeader,
+  useRoute,
+  useRuntimeConfig,
+} from '#imports'
 import PublicPageContent from '../components/PublicPageContent.vue'
 import { prefixInternalResolvedUrl } from '@baserow/modules/builder/utils/urlResolution'
 import {
@@ -378,6 +384,19 @@ const {
 
 if (error.value) {
   throw error.value
+}
+
+if (import.meta.server && mode !== 'preview') {
+  const securityHeaders = asyncDataResult.value?.builder?.security_headers
+  if (securityHeaders && typeof securityHeaders === 'object') {
+    nuxtApp.runWithContext(() => {
+      for (const [headerName, headerValue] of Object.entries(securityHeaders)) {
+        if (typeof headerValue === 'string' && headerValue.length > 0) {
+          useResponseHeader(headerName).value = headerValue
+        }
+      }
+    })
+  }
 }
 
 const workspace = computed(() => asyncDataResult.value?.workspace)

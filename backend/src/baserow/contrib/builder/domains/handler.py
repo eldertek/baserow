@@ -14,6 +14,7 @@ from baserow.contrib.builder.domains.exceptions import (
 )
 from baserow.contrib.builder.domains.models import Domain
 from baserow.contrib.builder.domains.registries import DomainType
+from baserow.contrib.builder.domains.security_headers import validate_security_headers
 from baserow.contrib.builder.exceptions import BuilderDoesNotExist
 from baserow.contrib.builder.models import Builder
 from baserow.contrib.builder.pages.handler import PageHandler
@@ -33,8 +34,8 @@ tracer = trace.get_tracer(__name__)
 
 
 class DomainHandler:
-    allowed_fields_create = ["domain_name"]
-    allowed_fields_update = ["domain_name", "last_published"]
+    allowed_fields_create = ["domain_name", "security_headers"]
+    allowed_fields_update = ["domain_name", "last_published", "security_headers"]
 
     def get_domain(
         self, domain_id: int, base_queryset: QuerySet | None = None, for_update=False
@@ -91,7 +92,12 @@ class DomainHandler:
             domain = (
                 Domain.objects.exclude(published_to=None)
                 .select_related("published_to", "builder__workspace")
-                .only("published_to", "builder")
+                .only(
+                    "published_to",
+                    "builder",
+                    "builder__security_headers",
+                    "security_headers",
+                )
                 .get(domain_name=domain_name)
             )
         except Domain.DoesNotExist:
@@ -100,6 +106,7 @@ class DomainHandler:
         if TrashHandler.item_has_a_trashed_parent(domain, check_item_also=True):
             raise BuilderDoesNotExist()
 
+        domain.published_to._resolved_domain = domain
         return domain.published_to
 
     def get_domain_for_builder(self, builder: Builder) -> Domain | None:
@@ -138,6 +145,11 @@ class DomainHandler:
         # Save only lower case domain
         if "domain_name" in prepared_values:
             prepared_values["domain_name"] = prepared_values["domain_name"].lower()
+
+        if "security_headers" in prepared_values:
+            prepared_values["security_headers"] = validate_security_headers(
+                prepared_values["security_headers"]
+            )
 
         domain = model_class(builder=builder, order=last_order, **prepared_values)
 
@@ -180,7 +192,16 @@ class DomainHandler:
         if "domain_name" in prepared_values:
             prepared_values["domain_name"] = prepared_values["domain_name"].lower()
 
+        if "security_headers" in prepared_values:
+            prepared_values["security_headers"] = validate_security_headers(
+                prepared_values["security_headers"]
+            )
+
         previous_domain_name = domain.domain_name
+        security_headers_changed = (
+            "security_headers" in prepared_values
+            and prepared_values["security_headers"] != domain.security_headers
+        )
 
         for key, value in prepared_values.items():
             setattr(domain, key, value)
@@ -197,6 +218,12 @@ class DomainHandler:
             transaction.on_commit(
                 lambda: self.invalidate_public_builder_by_domain_cache(
                     previous_domain_name
+                )
+            )
+        if security_headers_changed:
+            transaction.on_commit(
+                lambda: self.invalidate_public_builder_by_domain_cache(
+                    domain.domain_name
                 )
             )
 

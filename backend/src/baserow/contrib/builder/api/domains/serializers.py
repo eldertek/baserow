@@ -16,10 +16,14 @@ from baserow.contrib.builder.api.pages.serializers import (
     QueryParamSerializer,
 )
 from baserow.contrib.builder.api.serializers import BuilderSerializer
-from baserow.contrib.builder.api.validators import image_file_validation
+from baserow.contrib.builder.api.validators import (
+    image_file_validation,
+    security_headers_validator,
+)
 from baserow.contrib.builder.data_sources.models import DataSource
 from baserow.contrib.builder.domains.models import Domain
 from baserow.contrib.builder.domains.registries import domain_type_registry
+from baserow.contrib.builder.domains.security_headers import resolve_security_headers
 from baserow.contrib.builder.elements.models import Element
 from baserow.contrib.builder.elements.registries import element_type_registry
 from baserow.contrib.builder.models import Builder
@@ -32,6 +36,15 @@ from baserow.core.user_sources.models import UserSource
 from baserow.core.user_sources.registries import user_source_type_registry
 
 
+def _domain_security_headers_field():
+    return serializers.DictField(
+        child=serializers.CharField(allow_null=True, allow_blank=True),
+        validators=[security_headers_validator],
+        required=False,
+        help_text=Domain._meta.get_field("security_headers").help_text,
+    )
+
+
 class DomainSerializer(serializers.ModelSerializer):
     type = serializers.SerializerMethodField(help_text="The type of the domain.")
 
@@ -41,7 +54,15 @@ class DomainSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Domain
-        fields = ("id", "type", "domain_name", "order", "builder_id", "last_published")
+        fields = (
+            "id",
+            "type",
+            "domain_name",
+            "order",
+            "builder_id",
+            "last_published",
+            "security_headers",
+        )
         extra_kwargs = {
             "id": {"read_only": True},
             "builder_id": {"read_only": True},
@@ -55,12 +76,14 @@ class CreateDomainSerializer(serializers.ModelSerializer):
         required=True,
         help_text="The type of the domain.",
     )
+    security_headers = _domain_security_headers_field()
 
     class Meta:
         model = Domain
         fields = (
             "type",
             "domain_name",
+            "security_headers",
         )
 
 
@@ -74,12 +97,14 @@ class UpdateDomainSerializer(serializers.ModelSerializer):
     domain_name = serializers.CharField(
         required=False, help_text=Domain._meta.get_field("domain_name").help_text
     )
+    security_headers = _domain_security_headers_field()
 
     class Meta:
         model = Domain
         fields = (
             "type",
             "domain_name",
+            "security_headers",
         )
 
 
@@ -253,9 +278,25 @@ class PublicBuilderSerializer(BuilderSerializer):
 
     workspace = serializers.SerializerMethodField()
     untrusted_content = serializers.BooleanField(read_only=True)
+    security_headers = serializers.SerializerMethodField(
+        help_text="Resolved HTTP security headers for this published application."
+    )
 
     class Meta:
         ref_name = "PublicBuilderApplication"
+
+    @extend_schema_field(OpenApiTypes.OBJECT)
+    def get_security_headers(self, instance: Builder) -> dict:
+        domain = getattr(instance, "_resolved_domain", None)
+        if domain is None:
+            domain = getattr(instance, "published_from", None)
+        app_headers = (
+            domain.builder.security_headers
+            if domain is not None and domain.builder_id
+            else instance.security_headers
+        )
+        domain_headers = domain.security_headers if domain is not None else None
+        return resolve_security_headers(app_headers, domain_headers)
 
     @extend_schema_field(PublicPageSerializer(many=True))
     def get_pages(self, instance: Builder) -> List:

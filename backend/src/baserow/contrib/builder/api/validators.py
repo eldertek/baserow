@@ -1,6 +1,10 @@
 from rest_framework.exceptions import ValidationError
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
+from baserow.contrib.builder.domains.security_headers import (
+    SecurityHeadersValidationError,
+    validate_security_headers,
+)
 from baserow.contrib.builder.models import (
     BuilderBreakpointsValidationError,
     validate_builder_breakpoints,
@@ -38,6 +42,17 @@ def breakpoints_validator(value: object) -> None:
         validate_builder_breakpoints(value)
     except BuilderBreakpointsValidationError as exc:
         raise DRFValidationError(detail=exc.errors, code="invalid_breakpoints") from exc
+
+
+def security_headers_validator(value: object) -> None:
+    """Adapt HTTP security header validation for DRF fields."""
+
+    try:
+        validate_security_headers(value)
+    except SecurityHeadersValidationError as exc:
+        raise DRFValidationError(
+            detail=exc.errors, code="invalid_security_headers"
+        ) from exc
 
 
 def image_file_validation(file: UserFile) -> None:

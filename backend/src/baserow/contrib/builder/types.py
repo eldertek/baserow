@@ -82,3 +82,4 @@ class BuilderDict(TypedDict):
     favicon_file: Optional[dict]
     login_page: Optional[PageDict]
     breakpoints: Dict[str, int]
+    security_headers: NotRequired[Dict[str, Optional[str]]]

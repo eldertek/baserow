@@ -20,6 +20,7 @@ from baserow.contrib.builder.constants import IMPORT_SERIALIZED_IMPORTING
 from baserow.contrib.builder.data_providers.registries import (
     builder_data_provider_type_registry,
 )
+from baserow.contrib.builder.domains.security_headers import validate_security_headers
 from baserow.contrib.builder.models import (
     LEGACY_BUILDER_BREAKPOINTS,
     MAX_BUILDER_BREAKPOINT,
@@ -72,6 +73,7 @@ class BuilderApplicationType(ApplicationType):
         "favicon_file",
         "login_page_id",
         "breakpoints",
+        "security_headers",
     ]
     serializer_field_names = [
         "import_report",
@@ -79,6 +81,7 @@ class BuilderApplicationType(ApplicationType):
         "favicon_file",
         "login_page_id",
         "breakpoints",
+        "security_headers",
         "pages",
         "theme",
     ]
@@ -87,6 +90,7 @@ class BuilderApplicationType(ApplicationType):
         "favicon_file",
         "login_page_id",
         "breakpoints",
+        "security_headers",
         "pages",
         "theme",
         "user_sources",
@@ -96,6 +100,7 @@ class BuilderApplicationType(ApplicationType):
         "favicon_file",
         "login_page_id",
         "breakpoints",
+        "security_headers",
     ]
 
     serializer_mixins = [lazy_get_instance_serializer_class]
@@ -113,6 +118,7 @@ class BuilderApplicationType(ApplicationType):
             breakpoints_validator,
             image_file_validation,
             login_page_id_validator,
+            security_headers_validator,
         )
 
         return {
@@ -144,6 +150,15 @@ class BuilderApplicationType(ApplicationType):
                     "breakpoints are required."
                 ),
             ),
+            "security_headers": serializers.DictField(
+                child=serializers.CharField(allow_null=True, allow_blank=True),
+                validators=[security_headers_validator],
+                required=False,
+                help_text=(
+                    "Default HTTP security header overrides for published sites of "
+                    "this application."
+                ),
+            ),
         }
 
     def prepare_value_for_db(self, values: dict, instance: "Builder | None" = None):
@@ -164,6 +179,10 @@ class BuilderApplicationType(ApplicationType):
             raise serializers.ValidationError(
                 detail=f"The login page with id {login_page_id} doesn't exist.",
                 code="invalid_login_page_id",
+            )
+        if "security_headers" in values:
+            values["security_headers"] = validate_security_headers(
+                values["security_headers"]
             )
         return values
 
@@ -321,6 +340,7 @@ class BuilderApplicationType(ApplicationType):
             favicon_file=serialized_favicon_file,
             login_page=serialized_login_page,
             breakpoints=builder.breakpoints,
+            security_headers=builder.security_headers,
             **serialized_builder,
         )
         # Internal copies keep the restriction. An external import detects it again
@@ -461,6 +481,9 @@ class BuilderApplicationType(ApplicationType):
         breakpoints = validate_builder_breakpoints(
             serialized_values.pop("breakpoints", LEGACY_BUILDER_BREAKPOINTS.copy())
         )
+        security_headers = validate_security_headers(
+            serialized_values.pop("security_headers", {})
+        )
 
         (
             builder_progress,
@@ -494,7 +517,10 @@ class BuilderApplicationType(ApplicationType):
         # created builder application that should receive the new defaults.
         builder.breakpoints = breakpoints
         builder.untrusted_content = untrusted_content
-        builder.save(update_fields=["breakpoints", "untrusted_content"])
+        builder.security_headers = security_headers
+        builder.save(
+            update_fields=["breakpoints", "untrusted_content", "security_headers"]
+        )
         defer_untrusted_content_update(builder, cache, import_export_config)
 
         # Always initialize the integrations mapping, even when the export

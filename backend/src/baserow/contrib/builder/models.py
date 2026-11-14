@@ -107,6 +107,11 @@ class Builder(Application):
         default=default_builder_breakpoints,
         db_default=LEGACY_BUILDER_BREAKPOINTS,
     )
+    security_headers = models.JSONField(
+        default=dict,
+        db_default={},
+        help_text="Default HTTP security header overrides for published sites of this application.",
+    )
 
     favicon_file = models.ForeignKey(
         UserFile,

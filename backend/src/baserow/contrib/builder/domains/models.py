@@ -76,6 +76,12 @@ class Domain(
         related_name="published_from",
         help_text="The published builder.",
     )
+    security_headers = models.JSONField(
+        default=dict,
+        db_default={},
+        help_text="Optional HTTP security header overrides applied when serving "
+        "this published domain.",
+    )
 
     def get_parent(self):
         return self.builder
