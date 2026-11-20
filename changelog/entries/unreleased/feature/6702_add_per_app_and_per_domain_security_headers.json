@@ -1,0 +1,9 @@
+{
+    "type": "feature",
+    "message": "Added per-app and per-domain HTTP security header configuration for published Builder applications.",
+    "issue_origin": "github",
+    "issue_number": 6702,
+    "domain": "builder",
+    "bullet_points": [],
+    "created_at": "2026-11-20"
+}
