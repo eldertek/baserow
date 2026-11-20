@@ -78,7 +78,7 @@ import { filterRoles } from '@baserow_enterprise/utils/roles'
 
 /**
  * The share dialog of one object. One input adds existing subjects, like
- * members, teams and agents, with a role on the object, or invites a new person
+ * members, teams and identities, with a role on the object, or invites a new person
  * by email with a role on the object only. Below it, everyone with a direct
  * role is listed, pending invitations included, followed by who else reaches
  * the object through a level above it, by their effective access. Subjects can
@@ -87,7 +87,7 @@ import { filterRoles } from '@baserow_enterprise/utils/roles'
  * to nothing. Only assignable subject types take part; anonymous visitors are
  * display-only.
  *
- * A user or agent who is an admin of the workspace, or holds the admin role
+ * A user or identity who is an admin of the workspace, or holds the admin role
  * themselves on the database or table the object is in, keeps full access to
  * the object whatever role it has here. Such a row shows a locked admin role
  * with an explanation, and the picker lists them with that reason instead of
@@ -171,7 +171,7 @@ export default {
         : this.$t('shareScope.workspaceInvitationRequired')
     },
     /**
-     * The roles a member, team or agent can hold on the object, no access
+     * The roles a member, team or identity can hold on the object, no access
      * included.
      */
     assignableRoles() {
@@ -197,7 +197,7 @@ export default {
       )
     },
     /**
-     * The roles of the members, teams and agents that already hold a role on
+     * The roles of the members, teams and identities that already hold a role on
      * the object by their key, which the picker lists as such rather than
      * offers.
      */
@@ -244,7 +244,7 @@ export default {
       return parents
     },
     /**
-     * The users and agents whose role on the object has no effect because they
+     * The users and identities whose role on the object has no effect because they
      * are an admin of a level above it, as `{ '<subject type>:<id>': '<level>' }`
      * where the level is the lower case name of the outermost such level.
      */
@@ -323,7 +323,7 @@ export default {
             kind: roleAssignment.subject_type,
             name: subjectType.getDisplayName(subject),
             subtitle: subjectType.getSubtitle(subject),
-            badge: subjectType.getBadge(),
+            badge: subjectType.getBadge(subject),
             badgeColor: 'neutral',
             avatarComponent: subjectType.avatarComponent,
             subject,
@@ -469,7 +469,9 @@ export default {
         this.subjects[subjectType.type] =
           await subjectType.fetchAssignableSubjects(this.workspace)
       } catch (error) {
-        this.subjects[subjectType.type] = []
+        this.subjects[subjectType.type] = subjectType.isUser()
+          ? this.workspace.users
+          : []
         notifyIf(error)
       }
     },
@@ -591,7 +593,7 @@ export default {
     /**
      * Changes the role a pending invitation grants on the object, or revokes it
      * when `newRole` is null. Only this object is revoked, the invitation itself
-     * stays pending in the workspace.
+     * stays pending in the workspace, which a toast says after revoking.
      */
     async updateScopedInvitationRole(scopedInvitation, newRole) {
       const index = this.scopedInvitations.findIndex(
@@ -609,6 +611,15 @@ export default {
         const service = RoleAssignmentsService(this.$client)
         if (newRole === null) {
           await service.deleteScopedInvitation(scopedInvitation.id)
+          // Only the role on this object is taken back. The person can still
+          // join the workspace, so whoever revokes is told.
+          this.$store.dispatch('toast/info', {
+            title: this.$t('shareScope.invitationRevokedTitle'),
+            message: this.$t('shareScope.invitationRevokedMessage', {
+              email: previous.email,
+              type: this.scopeTypeName,
+            }),
+          })
         } else {
           await service.updateScopedInvitation(scopedInvitation.id, newRole)
         }

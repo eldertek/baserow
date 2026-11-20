@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from typing import Optional
+from urllib.parse import SplitResult, urljoin, urlsplit
 
 from django.conf import settings
 
@@ -40,7 +41,10 @@ from advocate.connectionpool import (
     ValidatingHTTPConnectionPool,
     ValidatingHTTPSConnectionPool,
 )
-from baserow.core.services.exceptions import ResponseTooLargeDispatchException
+from baserow.core.services.exceptions import (
+    RedirectNotAllowedDispatchException,
+    ResponseTooLargeDispatchException,
+)
 
 
 def _read_body(response, request_deadline: "_RequestDeadline") -> None:
@@ -468,6 +472,7 @@ class _DeadlineMixin:
 
     request_deadline: _RequestDeadline
     operation_timeout: Optional[float] = None
+    send_netrc_credentials: bool = True
     watched_pool_classes: dict
 
     def __init__(self, *args, **kwargs):
@@ -477,6 +482,17 @@ class _DeadlineMixin:
             # `ValidatingPoolManager`: this leaves advocate's mount lock, which
             # only guards `session.mount()`, untouched.
             adapter.poolmanager.pool_classes_by_scheme = self.watched_pool_classes
+
+    def rebuild_auth(self, prepared_request, response):
+        if self.send_netrc_credentials:
+            return super().rebuild_auth(prepared_request, response)
+        # What Requests does on a redirect, without adding the new host's
+        # `.netrc` credentials.
+        headers = prepared_request.headers
+        if "Authorization" in headers and self.should_strip_auth(
+            response.request.url, prepared_request.url
+        ):
+            del headers["Authorization"]
 
     def send(self, request, **kwargs):
         remaining = self.request_deadline.deadline - time.monotonic()
@@ -546,11 +562,49 @@ class _DeadlineAdvocateSession(_DeadlineMixin, advocate.Session):
     }
 
 
+def _effective_port(parts: SplitResult) -> int | None:
+    return parts.port or {"http": 80, "https": 443}.get(parts.scheme)
+
+
+def _check_redirect_stays_on_host(response: requests.Response) -> None:
+    """
+    :raises RedirectNotAllowedDispatchException: When the redirect points to
+        another host or port, or from https to http.
+    """
+
+    current = urlsplit(response.url)
+    try:
+        target = urlsplit(urljoin(response.url, response.headers["location"]))
+        same_host = target.hostname == current.hostname and (
+            _effective_port(target) == _effective_port(current)
+            # Moving from http to https on the default ports.
+            or (
+                (current.scheme, target.scheme) == ("http", "https")
+                and current.port is None
+                and target.port is None
+            )
+        )
+    except ValueError:
+        same_host = False
+    if not same_host or (current.scheme == "https" and target.scheme != "https"):
+        response.close()
+        raise RedirectNotAllowedDispatchException(
+            "The request was redirected to another server."
+        )
+
+
+def _no_auth(request):
+    return request
+
+
 def send_http_request(
     method: str,
     url: str,
     deadline: float,
     operation_timeout: Optional[float] = None,
+    redirects_stay_on_host: bool = False,
+    refuse_private_addresses: bool = False,
+    send_netrc_credentials: bool = True,
     **kwargs,
 ) -> requests.Response:
     """
@@ -562,6 +616,12 @@ def send_http_request(
     :param deadline: The `time.monotonic()` value the request must be over by.
     :param operation_timeout: The longest a single connect or read may wait,
         when that is shorter than what is left until `deadline`.
+    :param redirects_stay_on_host: Only follow a redirect to the same host,
+        and never from https to http.
+    :param refuse_private_addresses: Check every hop's address even when
+        `INTEGRATIONS_ALLOW_PRIVATE_ADDRESS` is on, for URLs a model picks.
+    :param send_netrc_credentials: Whether Requests may add the credentials of
+        the worker's `.netrc` for a matching host, redirects included.
     :param kwargs: Anything else `requests.Session.request` accepts, except
         `timeout`, `stream` and `hooks`, which this function sets itself and
         must not be passed in.
@@ -572,11 +632,14 @@ def send_http_request(
         this installation does not allow.
     :raises ResponseTooLargeDispatchException: When a body, the final one or a
         redirect's, is larger than this installation accepts.
+    :raises RedirectNotAllowedDispatchException: When `redirects_stay_on_host`
+        and a redirect points elsewhere.
     """
 
     session_class = (
         _DeadlineSession
         if settings.INTEGRATIONS_ALLOW_PRIVATE_ADDRESS is True
+        and not refuse_private_addresses
         else _DeadlineAdvocateSession
     )
     request_deadline = _RequestDeadline(deadline)
@@ -587,6 +650,8 @@ def send_http_request(
         # puts it under both.
         if response.is_redirect:
             _read_body(response, request_deadline)
+            if redirects_stay_on_host:
+                _check_redirect_stays_on_host(response)
 
     _watchdog.watch(request_deadline)
     token = _current_request_deadline.set(request_deadline)
@@ -598,6 +663,10 @@ def send_http_request(
             session.request_deadline = request_deadline
             session.operation_timeout = operation_timeout
             session.max_redirects = MAX_REDIRECTS
+            if not send_netrc_credentials:
+                session.send_netrc_credentials = False
+                # Requests only looks in `.netrc` when no auth is set.
+                session.auth = _no_auth
             response = session.request(
                 method=method,
                 url=url,

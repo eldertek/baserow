@@ -1,7 +1,8 @@
 import { AGENT_APPLICATION_TYPE } from '@baserow/modules/agent/constants'
+import { DEVELOPMENT_STAGES } from '@baserow/modules/core/constants'
 import { ApplicationType } from '@baserow/modules/core/applicationTypes'
 import AgentApplicationContext from '@baserow/modules/agent/components/AgentApplicationContext'
-import AgentApplicationForm from '@baserow/modules/agent/components/AgentApplicationForm'
+import AgentCreateModal from '@baserow/modules/agent/components/AgentCreateModal'
 import AgentApplicationSidebar from '@baserow/modules/agent/components/AgentApplicationSidebar'
 import { FF_AGENT_BUILDER } from '@baserow/modules/core/plugins/featureFlags'
 
@@ -42,16 +43,20 @@ export class AgentApplicationType extends ApplicationType {
     return AgentApplicationContext
   }
 
-  getApplicationFormComponent() {
-    return AgentApplicationForm
+  getCreateModalComponent() {
+    return AgentCreateModal
   }
 
   getSidebarComponent() {
     return AgentApplicationSidebar
   }
 
+  get developmentStage() {
+    return DEVELOPMENT_STAGES.BETA
+  }
+
   getOrder() {
-    return 100
+    return 10
   }
 
   populate(application) {
@@ -68,10 +73,13 @@ export class AgentApplicationType extends ApplicationType {
   }
 
   isVisible(application) {
-    return this.app.$hasPermission(
-      'application.read',
-      application,
-      application.workspace.id
+    return (
+      this.canBeCreated() &&
+      this.app.$hasPermission(
+        'application.read',
+        application,
+        application.workspace.id
+      )
     )
   }
 

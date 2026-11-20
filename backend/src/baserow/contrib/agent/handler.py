@@ -56,22 +56,29 @@ from baserow.core.exceptions import SubjectTypeNotExist
 from baserow.core.generative_ai.exceptions import GenerativeAITypeDoesNotExist
 from baserow.core.generative_ai.registries import generative_ai_model_type_registry
 from baserow.core.handler import CoreHandler
+from baserow.core.identities.exceptions import IdentityDoesNotExist
+from baserow.core.identities.handler import IdentityHandler
 from baserow.core.models import Workspace
 from baserow.core.operations import UpdateApplicationOperationType
 from baserow.core.registries import subject_type_registry
 from baserow.core.trash.handler import TrashHandler
 from baserow.core.types import Subject
+from baserow.core.user.identity import is_identity
 from baserow.core.utils import extract_allowed, remove_unstorable_characters
 
+from .action_tools.handler import AgentActionHandler
+from .action_tools.tools import BoundActionTool
 from .constants import (
     AGENT_RUN_LIMIT_REACHED,
     AGENT_RUN_TYPE,
+    CONVERSATION_USER_NAME_MAX_LENGTH,
+    DEACTIVATED_TOOLS_INSTRUCTIONS,
     DISALLOWED_TOOL_CALL_NOTE,
     HISTORY_MESSAGE_LIMIT,
-    MCP_TOOL_CHANGED_CALL_NOTE,
     REJECTED_TOOL_CALL_NOTE,
     RUN_AS_LOST_TOOL_CALL_NOTE,
     RUN_AS_SUBJECT_TYPES,
+    TOOL_CHANGED_CALL_NOTE,
     AgentConfigurationErrorCode,
     AgentReadinessState,
     AgentRunAsState,
@@ -101,6 +108,7 @@ from .types import (
     AgentConfigurationUpdated,
     AgentConversationCursor,
     AgentConversationUpdated,
+    AgentConversationUser,
     AgentMessageCreated,
     AgentPausedRun,
     AgentReplyRequest,
@@ -123,7 +131,7 @@ class AgentHandler:
     configuration_fields = ["instructions", "provider_type", "model_identifier"]
     conversation_fields = ["title", "pinned"]
     run_as_fields = ["run_as_subject_type", "run_as_subject_id"]
-    option_fields = ["web_search_enabled", "reasoning_effort"]
+    option_fields = ["web_search_enabled", "web_fetch_enabled", "reasoning_effort"]
 
     def get_agent(self, agent_id: int, for_update: bool = False) -> AgentApplication:
         """
@@ -167,10 +175,14 @@ class AgentHandler:
         run_as = self.resolve_run_as_subject(
             agent.run_as_subject_type, agent.run_as_subject_id, agent.workspace
         )
-        tools = self.get_tool_configuration(agent)
+        deactivated = self.get_deactivated_tools(agent.workspace)
+        tools = self.get_tool_configuration(agent, deactivated)
         with_tools = (
-            run_as.status == AgentRunAsState.ACTIVE and bool(tools["allowed_tools"])
-        ) or self.has_mcp_tools(agent)
+            (run_as.status == AgentRunAsState.ACTIVE and bool(tools["allowed_tools"]))
+            or self.has_mcp_tools(agent)
+            or bool(AgentActionHandler().get_callable_actions(agent))
+            or agent.web_fetch_enabled
+        )
         web_search_tool = self._get_web_search_tool(agent, with_tools)
         return AgentConfiguration(
             readiness=readiness,
@@ -183,14 +195,18 @@ class AgentHandler:
             ),
             run_as=run_as,
             **tools,
+            deactivated_tools=deactivated,
             web_search_enabled=agent.web_search_enabled,
             web_search_available=web_search_tool is not None,
             web_search_blocked_by_tools=web_search_tool is None
             and with_tools
             and self._get_web_search_tool(agent, False) is not None,
+            web_fetch_enabled=agent.web_fetch_enabled,
             available_trigger_types=AgentTriggerHandler().available_trigger_types(
                 agent
             ),
+            available_action_types=AgentActionHandler().available_action_types(agent),
+            max_actions=settings.BASEROW_AGENT_MAX_ACTIONS_PER_AGENT,
             max_queued_trigger_runs=settings.AGENT_TRIGGER_MAX_QUEUED_RUNS,
             max_parallel_trigger_runs=settings.AGENT_TRIGGER_MAX_PARALLEL_RUNS,
             errors=errors,
@@ -287,16 +303,42 @@ class AgentHandler:
             readiness = AgentReadinessState.READY
         return readiness, errors
 
-    def get_tool_configuration(self, agent: AgentApplication) -> AgentToolConfiguration:
+    def get_deactivated_tools(self, workspace: Workspace) -> list[str]:
         """
-        Return the tools the Agent may call and those that wait for the owner's
-        approval, leaving out tools no longer registered.
+        :param workspace: The workspace the Agent belongs to.
+        :return: The names of the registered tools the workspace can't use, in
+            registry order.
+        """
 
-        :param agent: The Agent to read.
-        :return: The allowed tool names and the ask first tool names, in registry
-            order. An unavailable selected identity retains its settings, but no
-            selected identity means tools are off.
+        return [
+            tool_type.type
+            for tool_type in agent_tool_type_registry.get_all()
+            if tool_type.is_deactivated(workspace)
+        ]
+
+    def get_available_tools(self, deactivated_tools: list[str]) -> list[dict]:
         """
+        List every tool an Agent can be allowed to call.
+
+        :param deactivated_tools: The names of the tools the workspace can't use.
+        :return: Each registered tool's name, group, whether it changes data and
+            whether it's deactivated, in registration order.
+        """
+
+        return [
+            {
+                "name": tool_type.type,
+                "group": tool_type.group,
+                "changes_data": tool_type.changes_data,
+                "deactivated": tool_type.type in deactivated_tools,
+            }
+            for tool_type in agent_tool_type_registry.get_all()
+        ]
+
+    def get_stored_tool_configuration(
+        self, agent: AgentApplication
+    ) -> AgentToolConfiguration:
+        """Read the Agent's saved grants, including temporarily locked tools."""
 
         if not agent.run_as_subject_type or not agent.run_as_subject_id:
             return {"allowed_tools": [], "ask_first_tools": []}
@@ -307,6 +349,25 @@ class AgentHandler:
         return {
             "allowed_tools": allowed_tools,
             "ask_first_tools": [name for name in allowed_tools if ask_first[name]],
+        }
+
+    def get_tool_configuration(
+        self, agent: AgentApplication, deactivated: list[str] | None = None
+    ) -> AgentToolConfiguration:
+        """Return only the saved grants available under the workspace licence."""
+
+        stored = self.get_stored_tool_configuration(agent)
+        if not stored["allowed_tools"]:
+            return stored
+        if deactivated is None:
+            deactivated = self.get_deactivated_tools(agent.workspace)
+        return {
+            "allowed_tools": [
+                name for name in stored["allowed_tools"] if name not in deactivated
+            ],
+            "ask_first_tools": [
+                name for name in stored["ask_first_tools"] if name not in deactivated
+            ],
         }
 
     def set_allowed_tools(
@@ -424,19 +485,22 @@ class AgentHandler:
         ):
             return missing
         subject = self.get_run_as_subject(subject_type, subject_id, include_trash=True)
-        if subject is None:
+        if not is_identity(subject) or not subject.is_active:
             return missing
-        registered_type = subject_type_registry.get(subject_type)
-        if not registered_type.is_in_workspace(subject, workspace, include_trash=True):
+        try:
+            identity_workspace = IdentityHandler.get_workspace(subject)
+        except IdentityDoesNotExist:
+            return missing
+        if identity_workspace.id != workspace.id:
             return missing
         return AgentRunAsResolution(
             AgentRunAsState.TRASHED
-            if getattr(subject, "trashed", False)
+            if subject.profile.trashed
             else AgentRunAsState.ACTIVE,
             subject_type,
             subject_id,
             subject,
-            registered_type.get_display_name(subject),
+            subject_type_registry.get(subject_type).get_display_name(subject),
         )
 
     def get_usable_run_as_subject(
@@ -454,6 +518,17 @@ class AgentHandler:
         resolution = self.resolve_run_as_subject(subject_type, subject_id, workspace)
         return (
             resolution.subject if resolution.status == AgentRunAsState.ACTIVE else None
+        )
+
+    def get_run_identity(self, agent: AgentApplication) -> Subject | None:
+        """
+        :param agent: The Agent, with its workspace.
+        :return: The Agent's run identity when the Agent may act as it now, or
+            None when it has none or the identity is trashed or gone.
+        """
+
+        return self.get_usable_run_as_subject(
+            agent.run_as_subject_type, agent.run_as_subject_id, agent.workspace
         )
 
     def update_configuration(
@@ -489,9 +564,10 @@ class AgentHandler:
         run_as = [values.get(field) for field in self.run_as_fields]
         if any(run_as) and not self.get_usable_run_as_subject(*run_as, agent.workspace):
             raise AgentRunAsSubjectDoesNotExist()
+        stored_tools = self.get_stored_tool_configuration(agent)
         original_values = {
             **{field: getattr(agent, field) for field in allowed_fields},
-            **self.get_tool_configuration(agent),
+            **stored_tools,
         }
         changed_fields = []
         for field, value in values.items():
@@ -516,14 +592,14 @@ class AgentHandler:
             agent.save(update_fields=[*changed_fields, "updated_on"])
         if tools_changed or not has_run_as or not had_run_as:
             self.set_allowed_tools(agent, allowed_tools, ask_first_tools)
+            stored_tools = self.get_stored_tool_configuration(agent)
         configuration = self.get_configuration(agent)
         return AgentConfigurationUpdated(
             agent=agent,
             original_values=original_values,
             new_values={
                 **{field: getattr(agent, field) for field in allowed_fields},
-                "allowed_tools": configuration.allowed_tools,
-                "ask_first_tools": configuration.ask_first_tools,
+                **stored_tools,
             },
             configuration=configuration,
         )
@@ -888,8 +964,8 @@ class AgentHandler:
         :param content: The content of the message.
         :param role: Who sent the message: a person or a trigger.
         :param uuid: The client's uuid of the message, or None for a new one.
-        :param raise_on_run_limit: Whether a workspace at its maximum of replies
-            running raises, or fails the reply with ``chat_run_limit_reached``.
+        :param raise_on_run_limit: Whether a reached reply limit raises, or fails
+            the reply with ``chat_run_limit_reached``.
         :param failure: The error code failing the reply instead of running or
             queueing it, or None.
         :param start_run: Whether the run starts now, or the reply stays queued
@@ -946,8 +1022,7 @@ class AgentHandler:
 
         :param conversation: The conversation, with its agent and owner.
         :param reply: The empty reply the run writes.
-        :raises ChatRunLimitReached: When the workspace has its maximum of replies
-            running.
+        :raises ChatRunLimitReached: When a reply limit is reached.
         :return: The run.
         """
 
@@ -966,8 +1041,7 @@ class AgentHandler:
         conversation's latest activity.
 
         :param reply: The reply, with its conversation, agent and workspace.
-        :raises ChatRunLimitReached: When the workspace has its maximum of replies
-            running.
+        :raises ChatRunLimitReached: When a reply limit is reached.
         :return: The run writing the reply.
         """
 
@@ -1042,6 +1116,24 @@ class AgentHandler:
         """
 
         return AgentToolApproval.objects.filter(status=AgentToolApproval.Status.PENDING)
+
+    def list_pending_replies(
+        self, conversations: QuerySet[AgentConversation]
+    ) -> QuerySet[AgentMessage]:
+        """Load pending approvals and their steps for the given conversations."""
+
+        pending = self._pending_approvals()
+        return (
+            AgentMessage.objects.filter(
+                Exists(pending.filter(reply_id=OuterRef("pk"))),
+                conversation__in=conversations,
+            )
+            .only("uuid", "steps", "conversation")
+            .select_related("conversation__trigger__service")
+            .prefetch_related(
+                Prefetch("approvals", queryset=pending, to_attr="pending_approvals")
+            )
+        )
 
     def get_conversation_pending_approval_counts(
         self, conversation_ids: list[int]
@@ -1189,8 +1281,7 @@ class AgentHandler:
         leaves the decisions pending.
 
         :param reply: The waiting reply, with its conversation, agent and owner.
-        :raises ChatRunLimitReached: When the workspace has its maximum of replies
-            running.
+        :raises ChatRunLimitReached: When a reply limit is reached.
         :return: The run continuing the reply.
         """
 
@@ -1269,6 +1360,20 @@ class AgentHandler:
             raise AgentConversationDoesNotExist
         return reply
 
+    def get_action_tools(self, agent: AgentApplication) -> list[BoundActionTool]:
+        """
+        Bind the Agent's enabled actions that are ready to run. They don't depend
+        on the Agent's workspace identity: they act through their own service.
+
+        :param agent: The Agent.
+        :return: One tool per callable action.
+        """
+
+        return [
+            BoundActionTool.from_action(action)
+            for action in AgentActionHandler().get_callable_actions(agent)
+        ]
+
     def get_reply_request(self, reply: AgentMessage) -> AgentReplyRequest:
         """
         Collect what the model needs to write a reply, or to continue it once the
@@ -1296,12 +1401,16 @@ class AgentHandler:
         )
         # A generation keeps its selected identity and tools until it ends or is
         # stopped. Configuration edits apply when the next generation is prepared.
+        deactivated = (
+            self.get_deactivated_tools(agent.workspace) if acting_subject else []
+        )
         tools: AgentToolConfiguration = (
-            self.get_tool_configuration(agent)
+            self.get_tool_configuration(agent, deactivated)
             if acting_subject
             else {"allowed_tools": [], "ask_first_tools": []}
         )
         mcp_servers = self.get_mcp_servers(agent)
+        action_tools = self.get_action_tools(agent)
         resume = (
             None
             if transcript is None
@@ -1315,6 +1424,7 @@ class AgentHandler:
                         for server in mcp_servers
                         for name, tool in server.model_tool_names().items()
                     },
+                    **{tool.type: tool.approval_key for tool in action_tools},
                 },
                 DISALLOWED_TOOL_CALL_NOTE
                 if acting_subject
@@ -1324,9 +1434,18 @@ class AgentHandler:
         prompt, history = (
             (None, []) if resume is not None else self._get_reply_prompt(reply)
         )
+        # Like search, a resumed run keeps opening pages only if it did before it
+        # paused and the setting is still on.
+        web_fetch_enabled = agent.web_fetch_enabled and (
+            transcript is None or transcript.paused_web_fetch
+        )
         web_search_tool = (
             self._get_web_search_tool(
-                agent, bool(tools["allowed_tools"]) or bool(mcp_servers)
+                agent,
+                bool(tools["allowed_tools"])
+                or bool(mcp_servers)
+                or bool(action_tools)
+                or web_fetch_enabled,
             )
             if agent.web_search_enabled
             and (transcript is None or transcript.paused_web_search)
@@ -1336,6 +1455,9 @@ class AgentHandler:
             reply_id=reply.id,
             workspace=agent.workspace,
             instructions=agent.instructions,
+            unavailable_tool_messages=self._get_unavailable_tool_messages(
+                agent, deactivated
+            ),
             provider_type=agent.provider_type,
             model_identifier=agent.model_identifier,
             prompt=prompt,
@@ -1346,11 +1468,15 @@ class AgentHandler:
             acting_subject=acting_subject,
             allowed_tool_names=tools["allowed_tools"],
             ask_first_tool_names=tools["ask_first_tools"],
+            action_tools=action_tools,
             timezone=self._get_reply_timezone(conversation),
+            conversation_user=self._get_conversation_user(conversation),
             mcp_servers=mcp_servers,
             reasoning_effort=agent.reasoning_effort,
             web_search_tool=web_search_tool,
             web_search_enabled=agent.web_search_enabled,
+            started_by_trigger=conversation.is_shared,
+            web_fetch_enabled=web_fetch_enabled,
         )
 
     def has_mcp_tools(self, agent: AgentApplication) -> bool:
@@ -1425,6 +1551,48 @@ class AgentHandler:
             return conversation.owner_user.profile.timezone
         return trigger_timezone_name(conversation.trigger.service.specific)
 
+    def _get_unavailable_tool_messages(
+        self, agent: AgentApplication, deactivated: list[str]
+    ) -> list[str]:
+        """
+        :param agent: The Agent to read.
+        :param deactivated: The tools its workspace can't use, in registry order.
+        :return: One instruction per reason, naming the tools the Agent was
+            allowed and its workspace can't use.
+        """
+
+        if not deactivated:
+            return []
+        lost = set(
+            agent.allowed_tools.filter(name__in=deactivated).values_list(
+                "name", flat=True
+            )
+        )
+        names_by_reason: dict[str, list[str]] = defaultdict(list)
+        for name in deactivated:
+            reason = agent_tool_type_registry.get(name).unavailable_reason
+            if name in lost and reason:
+                names_by_reason[reason].append(name)
+        return [
+            DEACTIVATED_TOOLS_INSTRUCTIONS.format(reason=reason, tools=", ".join(names))
+            for reason, names in names_by_reason.items()
+        ]
+
+    def _get_conversation_user(
+        self, conversation: AgentConversation
+    ) -> AgentConversationUser | None:
+        """
+        :param conversation: The conversation the reply is written in.
+        :return: The person it is with, named on one short line as the name ends
+            up in the instructions, or None when a trigger started it.
+        """
+
+        if conversation.is_shared:
+            return None
+        owner = conversation.owner_user
+        name = " ".join(owner.first_name.split())
+        return AgentConversationUser(owner.id, name[:CONVERSATION_USER_NAME_MAX_LENGTH])
+
     def _get_paused_transcript(
         self, reply: AgentMessage
     ) -> AgentReplyTranscript | None:
@@ -1441,6 +1609,7 @@ class AgentHandler:
             .only(
                 "paused_conversation",
                 "paused_web_search",
+                "paused_web_fetch",
                 "paused_run_as_subject_type",
                 "paused_run_as_subject_id",
             )
@@ -1474,7 +1643,7 @@ class AgentHandler:
         :param reply: The paused reply.
         :param paused_conversation: Its paused run, holding the calls.
         :param callable_tools: The tools the reply may call now, with the
-            approval key of the MCP ones.
+            approval key of the MCP ones and the actions.
         :param disallowed_note: Tells the model why an approved call can't run.
         :return: The paused run with the decisions and the saved steps.
         """
@@ -1497,7 +1666,10 @@ class AgentHandler:
         }
         return AgentReplyResume(
             paused_conversation=paused_conversation,
-            deferred_tool_results=held.build_results(approvals=results),
+            # A held action call sends the values kept when it was held.
+            deferred_tool_results=held.build_results(
+                approvals=results, metadata=held.metadata
+            ),
             saved_steps=reply.steps or [],
             held_step_ids={
                 tool_call_id: approval.step_id
@@ -1518,13 +1690,13 @@ class AgentHandler:
     ) -> ToolApproved | ToolDenied:
         """
         Tell the model what the owner decided about a held call. An approved call
-        to a tool the reply may no longer call, or to an MCP tool whose server,
-        account or definition changed since it was held, is denied instead, and
-        its step then shows a permission failure rather than a rejection.
+        to a tool the reply may no longer call, or to an MCP tool or action that
+        changed since it was held, is denied instead, and its step then shows a
+        permission failure rather than a rejection.
 
         :param approval: The decided approval of the call.
         :param callable_tools: The tools the reply may call now, with the
-            approval key of the MCP ones.
+            approval key of the MCP ones and the actions.
         :param disallowed_note: Tells the model why an approved call can't run.
         :return: Whether the call runs, or why it doesn't.
         """
@@ -1536,12 +1708,13 @@ class AgentHandler:
                 else REJECTED_TOOL_CALL_NOTE
             )
         if approval.tool_name not in callable_tools:
-            # An MCP tool doesn't act as the Agent's identity, so losing it isn't why.
+            # An MCP tool or action doesn't act as the Agent's identity, so losing
+            # it isn't why.
             return ToolDenied(
                 DISALLOWED_TOOL_CALL_NOTE if approval.tool_key else disallowed_note
             )
         if callable_tools[approval.tool_name] != approval.tool_key:
-            return ToolDenied(MCP_TOOL_CHANGED_CALL_NOTE)
+            return ToolDenied(TOOL_CHANGED_CALL_NOTE)
         return ToolApproved()
 
     def finish_reply(
@@ -1690,6 +1863,7 @@ class AgentHandler:
             return {
                 "paused_conversation": None,
                 "paused_web_search": False,
+                "paused_web_fetch": False,
                 "paused_run_as_subject_type": None,
                 "paused_run_as_subject_id": None,
             }
@@ -1699,6 +1873,7 @@ class AgentHandler:
                 paused_run.conversation
             ),
             "paused_web_search": paused_run.web_search,
+            "paused_web_fetch": paused_run.web_fetch,
             "paused_run_as_subject_type": None
             if run_as is None
             else subject_type_registry.get_by_model(run_as).type,

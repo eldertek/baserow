@@ -5,6 +5,7 @@ import { clearNuxtData, useNuxtApp, useRouter } from '#app'
 
 import { TestApp } from '@baserow/test/helpers/testApp'
 import TemplatePage from '@baserow/modules/core/components/template/TemplatePage'
+import LegacyTemplatePage from '@baserow/modules/core/components/template/legacy/LegacyTemplatePage'
 import { TEMPLATE_MODERATION } from '@baserow/modules/core/composables/useTemplateModeration'
 
 const projectTracker = {
@@ -94,6 +95,24 @@ describe('TemplatePage', () => {
     expect(wrapper.find('.details').text()).toBe('Project Tracker: Business')
     expect(wrapper.find('.list').isVisible()).toBe(false)
   })
+
+  test.each([true, false])(
+    'shows the tabs to the public templates, user_templates: %s',
+    async (enabled) => {
+      testApp.mock
+        .onGet('/templates/project-tracker/')
+        .reply(200, projectTracker)
+      testApp.mock.onGet('/templates/').reply(200, categories)
+      const wrapper = await testApp.mount(TemplatePage, {
+        route: '/template/project-tracker',
+        global: { stubs, mocks: { $featureFlagIsEnabled: () => enabled } },
+      })
+
+      await wrapper.find('.details__back').trigger('click')
+
+      expect(wrapper.find('.segment-control').exists()).toBe(enabled)
+    }
+  )
 
   test('shows the toasts, as it has no app layout', async () => {
     const wrapper = await mountPage('project-tracker')
@@ -354,7 +373,11 @@ describe('TemplatePage', () => {
       workspace: { id: workspaceId },
       tables: [],
     })
-    testApp.authenticate({ id: 1, preferences: {}, completed_onboarding: true })
+    testApp.authenticate({
+      id: 1,
+      preferences: {},
+      completed_onboarding: false,
+    })
     testApp.dontFailOnErrorResponses()
     testApp.mock.onGet('/workspaces/').reply(200, [{ id: 1, name: 'First' }])
     testApp.mock.onGet('/applications/').reply(200, [])
@@ -462,34 +485,62 @@ describe('TemplatePage', () => {
     expect(wrapper.find('.details').text()).toBe('Project Tracker:')
   })
 
-  test('fails with a not found error for an unknown template', async () => {
-    testApp.dontFailOnErrorResponses()
-    testApp.mock.onGet('/templates/unknown/').reply(404, {
-      error: 'ERROR_TEMPLATE_DOES_NOT_EXIST',
-    })
-    testApp.mock.onGet('/templates/').reply(200, categories)
+  test.each([
+    ['official', 'TemplatePreview', projectTracker],
+    ['user', 'TemplatePage', crm],
+  ])(
+    'LegacyTemplatePage shows an %s template in %s',
+    async (_type, shown, template) => {
+      testApp.mock.onGet(`/templates/${template.slug}/`).reply(200, template)
 
-    // Nuxt shows the error page for an error thrown in the page setup, here it
-    // is caught by the parent instead.
-    const errors = []
-    const Parent = defineComponent({
-      setup() {
-        onErrorCaptured((error) => {
-          errors.push(error)
-          return false
-        })
-        return () => h(TemplatePage)
-      },
-    })
-    await testApp.mount(Parent, {
-      route: '/template/unknown',
-      global: { stubs },
-    })
+      const wrapper = await testApp.mount(LegacyTemplatePage, {
+        route: `/template/${template.slug}`,
+        global: {
+          stubs: {
+            TemplatePage: { template: '<div class="TemplatePage" />' },
+            TemplatePreview: { template: '<div class="TemplatePreview" />' },
+          },
+        },
+      })
 
-    expect(errors[0]).toMatchObject({
-      statusCode: 404,
-      message: 'Template not found.',
-      fatal: true,
-    })
-  })
+      expect(wrapper.find(`.${shown}`).exists()).toBe(true)
+    }
+  )
+
+  test.each([
+    ['TemplatePage', TemplatePage],
+    ['LegacyTemplatePage', LegacyTemplatePage],
+  ])(
+    '%s fails with a not found error for an unknown template',
+    async (_name, Page) => {
+      testApp.dontFailOnErrorResponses()
+      testApp.mock.onGet('/templates/unknown/').reply(404, {
+        error: 'ERROR_TEMPLATE_DOES_NOT_EXIST',
+      })
+      testApp.mock.onGet('/templates/').reply(200, categories)
+
+      // Nuxt shows the error page for an error thrown in the page setup, here it
+      // is caught by the parent instead.
+      const errors = []
+      const Parent = defineComponent({
+        setup() {
+          onErrorCaptured((error) => {
+            errors.push(error)
+            return false
+          })
+          return () => h(Page)
+        },
+      })
+      await testApp.mount(Parent, {
+        route: '/template/unknown',
+        global: { stubs },
+      })
+
+      expect(errors[0]).toMatchObject({
+        statusCode: 404,
+        message: 'Template not found.',
+        fatal: true,
+      })
+    }
+  )
 })

@@ -38,7 +38,11 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.run import AgentRunResult
-from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, WrapperToolset
+from pydantic_ai.toolsets import (
+    AbstractToolset,
+    FunctionToolset,
+    WrapperToolset,
+)
 from pydantic_ai.toolsets.abstract import ToolsetTool
 from pydantic_ai.usage import UsageLimits
 from pydantic_core import to_jsonable_python
@@ -63,14 +67,18 @@ from baserow.core.tools import ToolContext
 from baserow.core.tools.errors import ToolErrorCode
 from baserow.core.utils import remove_null_characters
 
+from .action_tools.tools import BoundActionTool
 from .constants import (
     ASK_FIRST_INSTRUCTIONS,
+    CONVERSATION_USER_INSTRUCTIONS,
     INTERRUPTED_CHANGES_NOTE,
     INTERRUPTED_REPLY_NOTE,
     OUTPUT_RETRIES,
     REPLY_REQUEST_LIMIT,
     TOOL_RETRIES,
+    TRIGGER_CONVERSATION_INSTRUCTIONS,
     UNAVAILABLE_WORKSPACE_ACCESS_INSTRUCTIONS,
+    WEB_FETCH_INSTRUCTIONS,
     WEB_SEARCH_FAILED_INSTRUCTIONS,
     WEB_SEARCH_INSTRUCTIONS,
     WEB_SEARCH_STEP_MAX_QUERIES,
@@ -79,8 +87,9 @@ from .constants import (
 )
 from .models import AgentMessage
 from .previews import arguments_preview
-from .registries import agent_tool_type_registry, hold_call, input_shower
+from .registries import AgentToolType, agent_tool_type_registry, input_shower
 from .types import AgentPausedRun, AgentReplyRequest, AgentReplyResult
+from .web_fetch import web_fetch_tool
 
 if TYPE_CHECKING:
     from baserow.core.chat_runs.journal import ChatRunJournal
@@ -229,6 +238,7 @@ class _HeldCallsToolset(WrapperToolset[None]):
 
     is_held: Callable[[RunContext[None]], bool]
     tool_ctx: ToolContext
+    tools: dict[str, AgentToolType | BoundActionTool]
 
     async def call_tool(
         self,
@@ -238,8 +248,7 @@ class _HeldCallsToolset(WrapperToolset[None]):
         tool: ToolsetTool[None],
     ) -> Any:
         if not ctx.tool_call_approved and self.is_held(ctx):
-            return await sync_to_async(hold_call)(
-                agent_tool_type_registry.get(name),
+            return await sync_to_async(self.tools[name].hold_call)(
                 self.tool_ctx,
                 tool_args,
                 input_shower(ctx),
@@ -297,12 +306,19 @@ class AgentResponder:
         self._text_is_commentary = False
         self._result: AgentRunResult[str | DeferredToolRequests] | None = None
         self._web_search_tool: WebSearchTool | None = None
+        # Fetched by Baserow rather than the provider, so every model can use it.
+        self._web_fetch_tool = web_fetch_tool() if request.web_fetch_enabled else None
         self._response_calls: list[ToolCallPart] = []
         self._invalid_call_ids: set[str] = set()
         self._mcp_toolsets = [
             MCPServerToolset(server) for server in request.mcp_servers
         ]
         resume = request.resume
+        self._tools = {
+            name: agent_tool_type_registry.get(name)
+            for name in request.allowed_tool_names
+        }
+        self._tools.update({tool.type: tool for tool in request.action_tools})
         self._steps = (
             ChatRunSteps(journal, self._describe_call)
             if resume is None
@@ -331,11 +347,13 @@ class AgentResponder:
                     "changes_data": snapshot.changes_data,
                     "input": toolset.get_step_input(name),
                 }
-        if name == WebSearchTool.kind:
+        if name == WebSearchTool.kind or (
+            self._web_fetch_tool is not None and name == self._web_fetch_tool.name
+        ):
             return {"changes_data": False, "input": _web_search_step_input(arguments)}
-        if name not in self._request.allowed_tool_names:
+        if name not in self._tools:
             return None
-        tool = agent_tool_type_registry.get(name)
+        tool = self._tools[name]
         try:
             summary = tool.get_step_input(arguments)
         except Exception as exc:
@@ -343,7 +361,10 @@ class AgentResponder:
                 "Agent tool {} step input failed ({})", tool.type, type(exc).__name__
             )
             summary = {}
-        return {"changes_data": tool.changes_data, "input": summary}
+        description = {"changes_data": tool.changes_data, "input": summary}
+        if isinstance(tool, BoundActionTool):
+            description["presentation_type"] = tool.presentation_type
+        return description
 
     async def answer(self) -> ChatRunOutcome:
         """
@@ -365,8 +386,8 @@ class AgentResponder:
 
     def _get_instructions(self, web_search_tool: WebSearchTool | None) -> str:
         """
-        Combine saved instructions with this reply's workspace access and web search
-        context.
+        Combine saved instructions with this reply's workspace access, trigger and
+        web context.
 
         :param web_search_tool: The web search this attempt offers, if any.
         :return: The instructions.
@@ -374,11 +395,19 @@ class AgentResponder:
 
         request = self._request
         instructions = request.instructions
+        if request.conversation_user is not None:
+            instructions += "\n\n" + CONVERSATION_USER_INSTRUCTIONS.format(
+                name=request.conversation_user.name,
+                user_id=request.conversation_user.id,
+            )
         if request.run_as_unavailable:
             instructions += f"\n\n{UNAVAILABLE_WORKSPACE_ACCESS_INSTRUCTIONS}"
+        if request.started_by_trigger:
+            instructions += f"\n\n{TRIGGER_CONVERSATION_INSTRUCTIONS}"
         if (
             request.resume is not None
             or (request.allowed_tool_names and request.ask_first_tool_names)
+            or any(tool.ask_first for tool in request.action_tools)
             or any(
                 tool.ask_first
                 for server in request.mcp_servers
@@ -392,7 +421,11 @@ class AgentResponder:
             instructions += f"\n\n{WEB_SEARCH_FAILED_INSTRUCTIONS}"
         elif request.web_search_enabled:
             instructions += f"\n\n{WEB_SEARCH_UNAVAILABLE_INSTRUCTIONS}"
-        return instructions
+        if self._web_fetch_tool is not None:
+            instructions += f"\n\n{WEB_FETCH_INSTRUCTIONS}"
+        return "\n\n".join(
+            filter(None, [instructions, *request.unavailable_tool_messages])
+        )
 
     def _search_unavailable(self) -> None:
         """
@@ -534,14 +567,14 @@ class AgentResponder:
     def _toolsets(self) -> list[AbstractToolset[None]]:
         """
         The tools the reply may call: Baserow's, acting as the Agent's identity,
-        and those turned on for its MCP servers.
+        web fetch when it's turned on, and those turned on for its MCP servers.
 
         :return: The toolsets, none when the reply may call no tool.
         """
 
         request = self._request
         toolsets: list[AbstractToolset[None]] = []
-        if request.allowed_tool_names:
+        if self._tools:
             ctx = ToolContext(
                 user=request.acting_subject,
                 workspace=request.workspace,
@@ -550,15 +583,15 @@ class AgentResponder:
             toolsets.append(
                 _HeldCallsToolset(
                     FunctionToolset(
-                        [
-                            agent_tool_type_registry.get(name).get_tool(ctx)
-                            for name in request.allowed_tool_names
-                        ]
+                        [tool.get_tool(ctx) for tool in self._tools.values()]
                     ),
                     self._is_held,
                     ctx,
+                    self._tools,
                 )
             )
+        if self._web_fetch_tool is not None:
+            toolsets.append(FunctionToolset([self._web_fetch_tool]))
         return [
             *toolsets,
             *(
@@ -597,9 +630,11 @@ class AgentResponder:
         for call in calls:
             if call.tool_call_id in self._invalid_call_ids:
                 continue
-            if call.tool_name in request.allowed_tool_names:
-                changes_data = agent_tool_type_registry.get(call.tool_name).changes_data
-                ask_first = call.tool_name in request.ask_first_tool_names
+            if tool := self._tools.get(call.tool_name):
+                changes_data = tool.changes_data
+                ask_first = call.tool_name in request.ask_first_tool_names or (
+                    isinstance(tool, BoundActionTool) and tool.ask_first
+                )
             elif snapshot := self._mcp_tool(call.tool_name):
                 changes_data, ask_first = snapshot.changes_data, snapshot.ask_first
             else:
@@ -618,6 +653,15 @@ class AgentResponder:
             if snapshot := toolset.get_tool_snapshot(name):
                 return snapshot
         return None
+
+    def _action_tool(self, name: str) -> BoundActionTool | None:
+        """
+        :param name: A called tool's name.
+        :return: The action the reply offers under that name, if any.
+        """
+
+        tool = self._tools.get(name)
+        return tool if isinstance(tool, BoundActionTool) else None
 
     def _on_event(self, event: AgentStreamEvent | AgentRunResultEvent) -> None:
         """
@@ -718,13 +762,17 @@ class AgentResponder:
             tool_keys={
                 call.tool_name: tool.approval_key
                 for call in waiting_calls
-                if (tool := self._mcp_tool(call.tool_name))
+                if (
+                    tool := self._mcp_tool(call.tool_name)
+                    or self._action_tool(call.tool_name)
+                )
             },
             paused_run=AgentPausedRun(
                 conversation=ConversationTypeAdapter.dump_python(
                     self._result.conversation, mode="json"
                 ),
                 web_search=self._web_search_tool is not None,
+                web_fetch=self._web_fetch_tool is not None,
                 run_as=self._request.acting_subject,
             )
             if paused

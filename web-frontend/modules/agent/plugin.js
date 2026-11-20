@@ -3,9 +3,19 @@ import { AgentChatRunType } from '@baserow/modules/agent/chatRunTypes'
 import { AgentLastViewedItemType } from '@baserow/modules/agent/lastViewedItemTypes'
 import { AgentApplicationSearchType } from '@baserow/modules/agent/searchTypes'
 import { agentToolPresentationTypes } from '@baserow/modules/agent/toolPresentationTypes'
-import { TriggerDataProviderType } from '@baserow/modules/agent/dataProviderTypes'
+import {
+  TriggerDataProviderType,
+  ActionInputDataProviderType,
+} from '@baserow/modules/agent/dataProviderTypes'
+import {
+  HTTPAgentTriggerType,
+  RowsCreatedAgentTriggerType,
+  RowsDeletedAgentTriggerType,
+  RowsUpdatedAgentTriggerType,
+} from '@baserow/modules/agent/agentTriggerTypes'
 import { searchTypeRegistry } from '@baserow/modules/core/search/types/registry'
 import {
+  ActionsAgentConfigurationSectionType,
   ConnectedAppsAgentConfigurationSectionType,
   InstructionsAgentConfigurationSectionType,
   SettingsAgentConfigurationSectionType,
@@ -27,9 +37,26 @@ export default defineNuxtPlugin({
     }
     nuxtApp.$registry.registerNamespace('agentConfigurationSection')
     nuxtApp.$registry.registerNamespace('agentDataProvider')
+    nuxtApp.$registry.registerNamespace('agentTriggerType')
+    for (const TriggerType of [
+      HTTPAgentTriggerType,
+      RowsCreatedAgentTriggerType,
+      RowsUpdatedAgentTriggerType,
+      RowsDeletedAgentTriggerType,
+    ]) {
+      nuxtApp.$registry.register('agentTriggerType', new TriggerType(context))
+    }
     nuxtApp.$registry.register(
       'agentDataProvider',
       new TriggerDataProviderType(context)
+    )
+    nuxtApp.$registry.register(
+      'agentDataProvider',
+      new ActionInputDataProviderType(context)
+    )
+    nuxtApp.$registry.register(
+      'agentConfigurationSection',
+      new ActionsAgentConfigurationSectionType(context)
     )
     nuxtApp.$registry.register(
       'agentConfigurationSection',

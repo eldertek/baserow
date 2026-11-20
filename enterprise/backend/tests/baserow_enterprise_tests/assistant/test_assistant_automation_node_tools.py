@@ -62,7 +62,9 @@ def mock_formula_generator(request, monkeypatch):
         return
     monkeypatch.setattr(
         "baserow_enterprise.assistant.tools.automation.agents.repair_formula_errors",
-        lambda tool_context, tool_helpers, formula_errors, refs=None: [],
+        lambda tool_context, tool_helpers, formula_errors, refs=None: (
+            automation_agents.RepairResult([], [])
+        ),
     )
 
 
@@ -1525,3 +1527,352 @@ def test_a_refused_branch_leaves_the_other_branches_repaired(
     (error,) = result["formula_errors"]
     assert error["edge_label"] == "A"
     assert router.service.specific.edges.get(label="B").condition["formula"] == "true"
+
+
+def _editor_save(user, node_id, service):
+    """Save a node's service the way the editor does."""
+
+    AutomationNodeService().update_node(user, node_id, service=service)
+
+
+def _generate_after(edit, generated):
+    """A generator that lets an edit land while it runs, then answers."""
+
+    def generate(formulas, context):
+        edit()
+        return {key: value for key, value in generated.items() if key in formulas}
+
+    return generate
+
+
+def _resolved(formula):
+    return resolve_formula(formula, formula_runtime_function_registry, {})
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("edit", ["row_id", "mapping_value", "mapping_disabled"])
+def test_formula_repair_keeps_a_row_value_edited_while_it_was_generated(
+    data_fixture, monkeypatch, real_formula_pass, row_action_node, edit
+):
+    user, node, field = row_action_node
+    workflow = node.workflow
+    edits = {
+        "row_id": {"row_id": "'7'"},
+        "mapping_value": {
+            "field_mappings": [
+                {"field_id": field.id, "value": "'Edited'", "enabled": True}
+            ]
+        },
+        # The editor disables a field by leaving its mapping out.
+        "mapping_disabled": {"field_mappings": []},
+    }
+    monkeypatch.setattr(
+        automation_agents,
+        "get_generate_formulas_tool",
+        lambda _profile: _generate_after(
+            lambda: _editor_save(user, node.id, edits[edit]),
+            {"row_id": "'99'", field.id: "'Generated'"},
+        ),
+    )
+
+    result = update_nodes(
+        make_test_ctx(user, workflow.automation.workspace),
+        workflow_id=workflow.id,
+        nodes=[
+            NodeUpdate(
+                node_id=node.id,
+                row_id="$formula: the trigger row" if edit == "row_id" else None,
+                values=(
+                    None
+                    if edit == "row_id"
+                    else [AutomationFieldValue(field_id=field.id, value="$formula: x")]
+                ),
+            )
+        ],
+        thought="generate a formula",
+    )
+
+    service = AutomationNode.objects.get(id=node.id).service.specific
+    if edit == "row_id":
+        assert _resolved(service.row_id) == "7"
+    elif edit == "mapping_value":
+        assert _resolved(service.field_mappings.get(field=field).value) == "Edited"
+    else:
+        assert not service.field_mappings.filter(field=field).exists()
+    # Reported apart from formula_errors, so Kuma doesn't retry and overwrite it.
+    assert "formula_errors" not in result
+    [kept] = result["kept_user_edits"]
+    assert kept["node_id"] == node.id
+    assert "kept" in kept["note"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_formula_repair_keeps_an_email_subject_edited_while_it_was_generated(
+    data_fixture, monkeypatch, real_formula_pass
+):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    _automation, workflow_id = _create_test_workflow(data_fixture, user, workspace)
+    ctx = make_test_ctx(user, workspace)
+    email = list_nodes(ctx, workflow_id=workflow_id, thought="inspect")["nodes"][-1]
+    monkeypatch.setattr(
+        automation_agents,
+        "get_generate_formulas_tool",
+        lambda _profile: _generate_after(
+            lambda: _editor_save(user, email["id"], {"subject": "'Edited'"}),
+            {"subject": "'Generated'", "body": "'Generated body'"},
+        ),
+    )
+
+    result = update_nodes(
+        ctx,
+        workflow_id=workflow_id,
+        nodes=[
+            NodeUpdate(
+                node_id=email["id"],
+                subject="$formula: the date",
+                body="$formula: the time",
+            )
+        ],
+        thought="generate formulas",
+    )
+
+    service = AutomationNode.objects.get(id=email["id"]).service.specific
+    # Only the edited value is kept; the other one is still written.
+    assert _resolved(service.subject) == "Edited"
+    assert _resolved(service.body) == "Generated body"
+    assert [kept["field"] for kept in result["kept_user_edits"]] == ["subject"]
+    assert "formula_errors" not in result
+    assert result["updated_nodes"] == [{"node_id": email["id"], "label": "Send Email"}]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_formula_repair_keeps_a_condition_edited_on_a_branch_renamed_in_case(
+    data_fixture, monkeypatch, real_formula_pass
+):
+    from uuid import uuid4
+
+    from baserow.contrib.automation.nodes.registries import (
+        automation_node_type_registry,
+    )
+
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    _automation, workflow_id = _create_test_workflow(data_fixture, user, workspace)
+    ctx = make_test_ctx(user, workspace)
+    workflow = AutomationWorkflowHandler().get_workflow(workflow_id)
+    uid = str(uuid4())
+    router = AutomationNodeService().create_node(
+        user,
+        automation_node_type_registry.get("router"),
+        workflow,
+        reference_node_id=workflow.get_trigger().id,
+        service={"edges": [{"uid": uid, "label": "Yes", "condition": "false"}]},
+    )
+
+    def rename_and_edit():
+        _editor_save(
+            user,
+            router.id,
+            {"edges": [{"uid": uid, "label": "yes", "condition": "'edited'"}]},
+        )
+
+    monkeypatch.setattr(
+        automation_agents,
+        "get_generate_formulas_tool",
+        lambda _profile: _generate_after(rename_and_edit, {"Yes": "true"}),
+    )
+
+    result = update_nodes(
+        ctx,
+        workflow_id=workflow_id,
+        nodes=[
+            NodeUpdate(
+                node_id=router.id,
+                edges=[{"label": "Yes", "condition": "$formula: always"}],
+            )
+        ],
+        thought="update",
+    )
+
+    edge = router.service.specific.edges.get()
+    assert edge.condition["formula"] == "'edited'"
+    assert [kept["edge_label"] for kept in result["kept_user_edits"]] == ["Yes"]
+
+
+@pytest.mark.django_db
+def test_a_kept_value_stays_kept_when_the_write_fails(
+    data_fixture, monkeypatch, real_formula_pass, row_action_node
+):
+    user, node, field = row_action_node
+    workflow = node.workflow
+    monkeypatch.setattr(
+        automation_agents,
+        "get_generate_formulas_tool",
+        lambda _profile: _generate_after(
+            lambda: _editor_save(user, node.id, {"row_id": "'7'"}),
+            {"row_id": "'99'", field.id: "'Generated'"},
+        ),
+    )
+
+    update_node = automation_agents.shared_nodes.update_node
+
+    def fail_repair_write(*args, as_formulas=False, **kwargs):
+        # Only the repair writes as formulas; the tool's own update goes through.
+        if as_formulas:
+            raise RuntimeError("write failed")
+        return update_node(*args, as_formulas=as_formulas, **kwargs)
+
+    monkeypatch.setattr(
+        automation_agents.shared_nodes, "update_node", fail_repair_write
+    )
+
+    result = update_nodes(
+        make_test_ctx(user, workflow.automation.workspace),
+        workflow_id=workflow.id,
+        nodes=[
+            NodeUpdate(
+                node_id=node.id,
+                row_id="$formula: the trigger row",
+                values=[AutomationFieldValue(field_id=field.id, value="$formula: x")],
+            )
+        ],
+        thought="generate formulas",
+    )
+
+    # The mapping wasn't edited, so its failed write is an error to retry; the
+    # edited row ID is still reported as kept, so a retry doesn't overwrite it.
+    assert [error.get("field_id") for error in result["formula_errors"]] == [field.id]
+    assert result["formula_errors"][0]["error"] == "write failed"
+    assert [kept["field"] for kept in result["kept_user_edits"]] == ["row_id"]
+
+
+@pytest.mark.django_db
+def test_a_failed_read_before_generation_leaves_the_formula_error(
+    data_fixture, monkeypatch, real_formula_pass, row_action_node
+):
+    user, node, field = row_action_node
+    workflow = node.workflow
+    calls = []
+
+    def fail(*args):
+        raise RuntimeError("read failed")
+
+    monkeypatch.setattr(automation_agents, "_stored_values", fail)
+    monkeypatch.setattr(
+        automation_agents,
+        "get_generate_formulas_tool",
+        lambda _profile: lambda formulas, context: calls.append(formulas) or {},
+    )
+
+    result = update_nodes(
+        make_test_ctx(user, workflow.automation.workspace),
+        workflow_id=workflow.id,
+        nodes=[NodeUpdate(node_id=node.id, row_id="$formula: the trigger row")],
+        thought="generate a formula",
+    )
+
+    assert calls == []
+    [error] = result["formula_errors"]
+    assert error["error"] == "read failed"
+
+
+@pytest.mark.django_db(transaction=True)
+def test_add_nodes_tells_the_generator_which_node_wrote_the_previous_row(
+    data_fixture, monkeypatch, real_formula_pass
+):
+    user = data_fixture.create_user()
+    workspace = data_fixture.create_workspace(user=user)
+    automation = data_fixture.create_automation_application(
+        user=user, workspace=workspace
+    )
+    database = data_fixture.create_database_application(workspace=workspace)
+    contacts = data_fixture.create_database_table(database=database)
+    log = data_fixture.create_database_table(database=database)
+    source = data_fixture.create_text_field(table=log, name="Source")
+    ctx = make_test_ctx(user, workspace)
+
+    created = create_workflows(
+        ctx,
+        automation_id=automation.id,
+        workflows=[
+            WorkflowCreate(
+                name="Log contacts",
+                trigger=TriggerNodeCreate(
+                    ref="trigger",
+                    label="Contact created",
+                    type="rows_created",
+                    rows_triggers_settings={"table_id": contacts.id},
+                ),
+                nodes=[
+                    ActionNodeCreate(
+                        ref="log",
+                        label="Add log entry",
+                        previous_node_ref="trigger",
+                        type="create_row",
+                        table_id=log.id,
+                        values=[AutomationFieldValue(field_id=source.id, value="new")],
+                    )
+                ],
+            )
+        ],
+        thought="create workflow",
+    )
+    workflow_id = created["created_workflows"][0]["id"]
+    trigger, create = list_nodes(ctx, workflow_id=workflow_id, thought="inspect")[
+        "nodes"
+    ]
+    generator_calls = []
+
+    def generate(formulas, context):
+        generator_calls.append((formulas, context.get_context_metadata()))
+        return {"row_id": f"get('previous_node.{create['id']}.id')"}
+
+    monkeypatch.setattr(
+        automation_agents, "get_generate_formulas_tool", lambda _profile: generate
+    )
+
+    result = add_nodes(
+        ctx,
+        workflow_id=workflow_id,
+        nodes=[
+            ActionNodeCreate(
+                ref="update",
+                label="Set source",
+                previous_node_ref=str(create["id"]),
+                type="update_row",
+                table_id=log.id,
+                row_id="$formula: ID of the row created by the previous step",
+                values=[AutomationFieldValue(field_id=source.id, value="automation")],
+            )
+        ],
+        thought="update the created row",
+    )
+
+    assert "formula_errors" not in result
+    [(formulas, metadata)] = generator_calls
+    # "The previous step" names the create_row node, and each node says how its
+    # data is read: the trigger's rows by index, the created row without one.
+    assert f"follows node {create['id']} ('Add log entry')" in formulas["row_id"]
+    created, fired = metadata[str(create["id"])], metadata[str(trigger["id"])]
+    assert created["node_type"] == "local_baserow_create_row"
+    assert created["formula_path"] == f"previous_node.{create['id']}"
+    assert fired["node_type"] == "local_baserow_rows_created"
+    assert fired["formula_path"] == f"previous_node.{trigger['id']}.0"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("label", ["Add log entry", ""])
+def test_formula_requests_name_the_node_this_one_follows(data_fixture, label):
+    node = data_fixture.create_local_baserow_update_row_action_node()
+    previous = data_fixture.create_local_baserow_create_row_action_node(
+        workflow=node.workflow, label=label
+    )
+    error = {"field": "row_id", "formula": "$formula: the created row"}
+
+    [request] = automation_agents.formula_requests(node, [error], previous).values()
+    [without] = automation_agents.formula_requests(node, [error]).values()
+
+    named = f"node {previous.id} ('{label}')" if label else f"node {previous.id}:"
+    assert f"This node follows {named}" in request
+    assert "follows" not in without

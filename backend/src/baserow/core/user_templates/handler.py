@@ -9,11 +9,14 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AbstractUser
 from django.core.cache import cache
 from django.core.files import File
+from django.core.files.storage import Storage
 from django.db import IntegrityError, connection, transaction
 from django.db.models import (
+    BooleanField,
     Case,
     CharField,
     Exists,
+    ExpressionWrapper,
     F,
     OuterRef,
     Q,
@@ -45,6 +48,7 @@ from baserow.core.models import (
     UserTemplateState,
     Workspace,
     is_instance_admin,
+    template_root_q,
 )
 from baserow.core.registries import ImportExportConfig, application_type_registry
 from baserow.core.storage import get_default_storage
@@ -63,6 +67,7 @@ from baserow.core.user_templates.constants import (
     USER_TEMPLATE_ICON_MAX_LENGTH,
     USER_TEMPLATE_ICON_REGEX,
     USER_TEMPLATE_PURGE_BATCH_SIZE,
+    USER_TEMPLATE_RESERVED_CATEGORY_NAMES,
     InstallAccess,
 )
 from baserow.core.user_templates.exceptions import (
@@ -79,7 +84,11 @@ from baserow.core.user_templates.exceptions import (
     TemplateSlugGenerationFailed,
     TemplateUpdated,
 )
-from baserow.core.user_templates.types import TemplateMetadata
+from baserow.core.user_templates.file_transfer import (
+    TemplateContent,
+    TemplateFilesTransfer,
+)
+from baserow.core.user_templates.types import TemplateMetadata, UnblockOutcome
 from baserow.core.utils import ChildProgressBuilder
 
 User = get_user_model()
@@ -118,11 +127,10 @@ def generate_template_slug(name: str) -> str:
 
 def user_template_copy_config() -> ImportExportConfig:
     """
-    Returns the configuration with which the content of a user template is
-    copied, both into the template and out of it when it's installed (the
-    install fills in the search data of the copy). The copy is made as if nobody
-    were a member of the target workspace, so it drops what belongs to the users
-    of the source: personal views, collaborators and sensitive data.
+    Returns the configuration with which the content of a user template is copied, into
+    the template and out of it when it's installed. The copy is made as if nobody were
+    a member of the target workspace, so it drops what belongs to the users of the
+    source: personal views, collaborators and sensitive data.
     """
 
     return ImportExportConfig(
@@ -157,17 +165,22 @@ def author_name_expression(author: str) -> Coalesce:
 
 class UserTemplateHandler:
     def validate_icon_and_categories(
-        self, icon: str, category_ids: Iterable[int]
+        self, icon: str, category_ids: Iterable[int], allow_reserved: bool = False
     ) -> list[TemplateCategory]:
         """
         Checks the icon and the categories chosen for a user template.
 
         :param icon: The icon class name, an iconoir class.
         :param category_ids: The ids of the existing categories, at least one
-            unless the instance has none, like one that never synced templates.
+            unless the instance has none an author can pick, like one that never
+            synced templates.
+        :param allow_reserved: Whether the categories may be reserved for official
+            templates, see `USER_TEMPLATE_RESERVED_CATEGORY_NAMES`. Only when the
+            author doesn't choose them, so that a template that is in one already
+            keeps it.
         :raises InvalidTemplateIcon: If the icon isn't allowed.
-        :raises InvalidTemplateCategory: If no category is given while there are
-            some, or one of them doesn't exist.
+        :raises InvalidTemplateCategory: If no category is given while some can
+            be picked, one of them doesn't exist, or one is reserved.
         :return: The categories.
         """
 
@@ -180,13 +193,22 @@ class UserTemplateHandler:
 
         category_ids = set(category_ids)
         if not category_ids:
-            if TemplateCategory.objects.exists():
+            if TemplateCategory.objects.exclude(
+                name__in=USER_TEMPLATE_RESERVED_CATEGORY_NAMES
+            ).exists():
                 raise InvalidTemplateCategory("At least one category is required.")
             return []
 
         categories = list(TemplateCategory.objects.filter(id__in=category_ids))
         if len(categories) != len(category_ids):
             raise InvalidTemplateCategory("The categories are invalid.")
+        if not allow_reserved and any(
+            category.name in USER_TEMPLATE_RESERVED_CATEGORY_NAMES
+            for category in categories
+        ):
+            raise InvalidTemplateCategory(
+                "This category can't be used for user templates."
+            )
 
         return categories
 
@@ -259,8 +281,8 @@ class UserTemplateHandler:
         :param metadata: The private metadata of revision 1, built with
             `build_template_metadata`.
         :raises InvalidTemplateIcon: If the icon isn't allowed.
-        :raises InvalidTemplateCategory: If no category is given while there are
-            some, or one of them doesn't exist.
+        :raises InvalidTemplateCategory: If no category is given while some can
+            be picked, or one of them doesn't exist.
         :raises ValidationError: If the template isn't valid.
         :raises TemplateSlugGenerationFailed: If no free slug was found.
         :raises UserNotFound: If the owner was deleted.
@@ -325,6 +347,7 @@ class UserTemplateHandler:
         workspace: Workspace,
         archive: Optional[File | str] = None,
         metadata: Optional[TemplateMetadata] = None,
+        allow_reserved: bool = False,
     ) -> Template:
         """
         Creates the next revision of a user template, whose content is already
@@ -346,13 +369,15 @@ class UserTemplateHandler:
             file already in the storage.
         :param metadata: The private metadata of the revision, built with
             `build_template_metadata` or `get_source_metadata`.
+        :param allow_reserved: Whether the categories may be reserved, see
+            `validate_icon_and_categories`.
         :raises TemplateDoesNotExist: If the user doesn't own the template anymore,
             or it's marked for deletion.
         :raises TemplateChangedDuringUpdate: If the template has a newer revision
             than `base_revision`.
         :raises InvalidTemplateIcon: If the icon isn't allowed.
-        :raises InvalidTemplateCategory: If no category is given while there are
-            some, or one of them doesn't exist.
+        :raises InvalidTemplateCategory: If no category is given while some can
+            be picked, one of them doesn't exist, or one is reserved.
         :raises ValidationError: If the revision isn't valid.
         :return: The created revision.
         """
@@ -366,7 +391,9 @@ class UserTemplateHandler:
                     "The template was changed while it was being updated."
                 )
 
-            categories = self.validate_icon_and_categories(icon, category_ids)
+            categories = self.validate_icon_and_categories(
+                icon, category_ids, allow_reserved=allow_reserved
+            )
             revision = Template(
                 type=root.type,
                 root=root,
@@ -397,16 +424,22 @@ class UserTemplateHandler:
         applications: List[Application],
         config: ImportExportConfig,
         *,
+        files_zip: TemplateFilesTransfer,
+        storage: Optional[Storage] = None,
         progress_builder: Optional[ChildProgressBuilder] = None,
     ) -> List[Dict[str, Any]]:
         """
         Serializes the applications in memory, each one in its own consistent
         snapshot, so that they can be imported with
-        `CoreHandler.import_applications_to_workspace`. Like a duplicate, the
-        copy refers to the same user files, so no file is exported.
+        `CoreHandler.import_applications_to_workspace`. The user files they refer
+        to are recorded in `files_zip`, so that the import copies them.
 
         :param applications: The applications to serialize.
         :param config: The configuration of the copy.
+        :param files_zip: Records the user files the applications refer to. It is
+            required, so that no caller copies the applications without their files
+            and leaves the copy sharing the user files of the source.
+        :param storage: The storage the user files are read from.
         :param progress_builder: A progress builder that allows for publishing
             progress.
         :return: The serialized applications.
@@ -421,7 +454,9 @@ class UserTemplateHandler:
             application_type = application_type_registry.get_by_model(application)
             with application_type.export_safe_transaction_context(application):
                 serialized.append(
-                    application_type.export_serialized(application, config)
+                    application_type.export_serialized(
+                        application, config, files_zip, storage
+                    )
                 )
             progress.increment()
         return serialized
@@ -463,6 +498,8 @@ class UserTemplateHandler:
         # Nobody is a member of the new workspace, so the import drops what
         # belongs to the users of the source: personal views and collaborators.
         config = user_template_copy_config()
+        storage = get_default_storage()
+        files = TemplateFilesTransfer(storage)
 
         workspace = Workspace.objects.create(name=name)
         track_content(template_workspace=workspace)
@@ -470,13 +507,16 @@ class UserTemplateHandler:
         serialized = self.serialize_applications(
             applications,
             config,
+            files_zip=files,
+            storage=storage,
             progress_builder=progress.create_child_builder(represents_progress=50),
         )
         CoreHandler().import_applications_to_workspace(
             workspace,
             serialized,
-            None,
-            config,
+            files,
+            dataclasses.replace(config, user_files_belong_to_workspace=True),
+            storage=storage,
             progress_builder=progress.create_child_builder(represents_progress=50),
             atomic_per_application=True,
         )
@@ -488,26 +528,33 @@ class UserTemplateHandler:
         revision: Template,
         *,
         progress_builder: Optional[ChildProgressBuilder] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> TemplateContent:
         """
         Serializes the applications of a revision of a user template, so that
         they can be installed with `install_template_content`. Each application
         is serialized in its own snapshot, so this must not be called inside an
-        atomic block.
+        atomic block. The files are only recorded, the install reads them from
+        the storage.
 
         :param revision: The revision to serialize.
         :param progress_builder: A progress builder that allows for publishing
             progress.
         :raises TemplateHasNoContent: If the revision has no application to copy.
             An install of nothing would leave no trace that it committed.
-        :return: The serialized applications.
+        :return: The serialized applications and the transfer of their files.
         """
 
-        return self.serialize_applications(
-            self._get_content_applications(revision),
+        applications = self._get_content_applications(revision)
+        storage = get_default_storage()
+        files = TemplateFilesTransfer(storage)
+        serialized = self.serialize_applications(
+            applications,
             user_template_copy_config(),
+            files_zip=files,
+            storage=storage,
             progress_builder=progress_builder,
         )
+        return TemplateContent(applications=serialized, files=files)
 
     def _get_content_applications(self, revision: Template) -> List[Application]:
         """
@@ -625,7 +672,7 @@ class UserTemplateHandler:
         user: AbstractUser,
         workspace: Workspace,
         revision: Template,
-        content: List[Dict[str, Any]],
+        content: TemplateContent,
         *,
         progress_builder: Optional[ChildProgressBuilder] = None,
     ) -> List[Application]:
@@ -651,9 +698,10 @@ class UserTemplateHandler:
         )
         applications, _ = CoreHandler().import_applications_to_workspace(
             workspace,
-            content,
-            None,
+            content.applications,
+            content.files,
             config,
+            storage=content.files.storage,
             progress_builder=progress_builder,
         )
 
@@ -771,10 +819,10 @@ class UserTemplateHandler:
 
     def list_templates_for_admin(self, state: UserTemplateState) -> QuerySet[Template]:
         """
-        Returns the annotated rows of a tab of the admin page.
+        Returns the annotated rows of a tab of the admin page. Only the rows of the
+        blocked tab can be `updated_since_blocked`.
 
-        :param state: The tab, one of `USER_TEMPLATE_ADMIN_STATES`, or the state of
-            a template an admin unblocked.
+        :param state: The tab, one of `USER_TEMPLATE_ADMIN_STATES`.
         :return: The rows of the tab.
         """
 
@@ -807,14 +855,24 @@ class UserTemplateHandler:
                 .annotate(can_approve=Value(False), edited_since_submitted=Value(False))
             )
         else:
+            open_review = Template.objects.open_reviews().filter(
+                family_id=OuterRef("family_id")
+            )
             rows = (
                 Template.objects.user()
-                .filter_by_root(marked_for_deletion_at__isnull=True)
                 .latest_revisions()
-                .with_template_state()
-                .filter(template_state=state)
+                .filter_by_root(
+                    marked_for_deletion_at__isnull=True,
+                    blocked_at__isnull=True,
+                    public_revision__isnull=True,
+                )
+                .filter(~Exists(open_review))
                 .annotate(can_approve=Value(False), edited_since_submitted=Value(False))
             )
+        if state == UserTemplateState.BLOCKED:
+            rows = rows.with_updated_since_blocked()
+        else:
+            rows = rows.annotate(updated_since_blocked=Value(False))
 
         return rows.annotate(
             admin_state=Value(state, output_field=CharField()),
@@ -826,6 +884,10 @@ class UserTemplateHandler:
             template_updated_on=F("created_on"),
             template_install_count=Coalesce(
                 F("root__install_count"), F("install_count")
+            ),
+            template_private_link=ExpressionWrapper(
+                template_root_q(private_link_token__isnull=False),
+                output_field=BooleanField(),
             ),
         ).select_related("author", "root__author")
 
@@ -1012,12 +1074,14 @@ class UserTemplateHandler:
         revisions: List[Tuple[int, Optional[int]]],
         reviewer: Optional[AbstractUser],
         rejected_template_ids: Optional[List[int]] = None,
+        root_fields: Optional[Dict[str, Any]] = None,
         **fields: Any,
     ) -> None:
         """
         Approves and lists revisions, at most one per template, in bulk, and
-        closes the rejections of those templates. The caller holds the locks of
-        the roots.
+        closes the rejections of those templates. Each row is written by one
+        update, the root with `root_fields`. The caller holds the locks of the
+        roots.
 
         :param revisions: The id and the root id of each revision, the root id
             None for revision 1, which is the root.
@@ -1025,8 +1089,11 @@ class UserTemplateHandler:
             review. A revision approved already, listed again, keeps its review.
         :param rejected_template_ids: The root ids of the templates with a reject
             reason to clear, all of them when None.
+        :param root_fields: Other values to write to the roots, by field name.
         :param fields: Other values to write to the revisions, by field name.
         """
+
+        root_fields = root_fields or {}
 
         approved = Q(review_state=Template.ReviewState.APPROVED)
         values = {
@@ -1038,12 +1105,13 @@ class UserTemplateHandler:
                 When(approved, then=F("reviewed_by_id")),
                 default=Value(reviewer.id if reviewer else None),
             ),
+            "reject_reason": "",
             **fields,
         }
         first_ids = [revision_id for revision_id, root_id in revisions if not root_id]
         edit_ids = [revision_id for revision_id, root_id in revisions if root_id]
         Template.objects.filter(id__in=first_ids).update(
-            **values, public_revision_id=F("id")
+            **values, **root_fields, public_revision_id=F("id")
         )
         Template.objects.filter(id__in=edit_ids).update(**values)
         Template.objects.filter(
@@ -1053,7 +1121,9 @@ class UserTemplateHandler:
                 Template.objects.filter(root_id=OuterRef("id"), id__in=edit_ids)
                 .order_by()
                 .values("id")[:1]
-            )
+            ),
+            reject_reason="",
+            **root_fields,
         )
         if rejected_template_ids is None:
             rejected_template_ids = [
@@ -1229,22 +1299,24 @@ class UserTemplateHandler:
             seen_reviewed_on,
             self.reject_applies,
         )
+        revision_fields = [
+            "review_state",
+            "reject_reason",
+            "reviewed_by",
+            "reviewed_on",
+        ]
         unlisted = self.reject_unlists(seen_state, seen_listed)
-        if unlisted:
+        if unlisted and revision.root_id is None:
+            revision.public_revision = None
+            revision_fields.append("public_revision")
+        elif unlisted:
             self.withdraw_listing(revision.get_root())
 
         revision.review_state = Template.ReviewState.REJECTED
         revision.reject_reason = reason
         revision.reviewed_by = admin
         revision.reviewed_on = timezone.now()
-        revision.save(
-            update_fields=[
-                "review_state",
-                "reject_reason",
-                "reviewed_by",
-                "reviewed_on",
-            ]
-        )
+        revision.save(update_fields=revision_fields)
         return revision, unlisted
 
     def approve_pending_revisions(self, admin: AbstractUser) -> int:
@@ -1258,13 +1330,7 @@ class UserTemplateHandler:
         :return: The number of approved revisions.
         """
 
-        pending = (
-            Template.objects.review_queue()
-            .approvable()
-            .filter(review_state=Template.ReviewState.PENDING)
-            .with_template_state()
-            .filter(has_open_rejection=False)
-        )
+        pending = Template.objects.review_queue().approvable_without_review()
         # Locked before the pending revisions are read, so they can't change until
         # approved. None joins the queue meanwhile: submits hold the settings row
         # FOR SHARE, which this transaction updated.
@@ -1278,13 +1344,8 @@ class UserTemplateHandler:
             .select_for_update()
             .values_list("id", flat=True)
         )
-        has_reject_reason = Exists(
-            Template.objects.filter(
-                Q(id=OuterRef("family_id")) | Q(root_id=OuterRef("family_id"))
-            ).exclude(reject_reason="")
-        )
         rows = list(
-            pending.annotate(has_reject_reason=has_reject_reason).values_list(
+            pending.annotate(has_reject_reason=self._has_reject_reason()).values_list(
                 "id", "root_id", "has_reject_reason"
             )
         )
@@ -1298,6 +1359,20 @@ class UserTemplateHandler:
             ],
         )
         return len(rows)
+
+    def _has_reject_reason(self) -> Exists:
+        """
+        Whether a revision of the template of the row has a reject reason, which
+        `_approve_revisions` clears. The rows need a `family_id`.
+
+        :return: The expression.
+        """
+
+        return Exists(
+            Template.objects.filter(
+                Q(id=OuterRef("family_id")) | Q(root_id=OuterRef("family_id"))
+            ).exclude(reject_reason="")
+        )
 
     def withdraw_review(self, root: Template) -> Optional[Template]:
         """
@@ -1345,24 +1420,22 @@ class UserTemplateHandler:
         root.public_revision = None
         root.save(update_fields=["public_revision"])
 
-    def make_template_private(
-        self, root: Template, update_fields: Iterable[str] = ()
-    ) -> Optional[int]:
+    def make_template_private(self, root: Template) -> Optional[int]:
         """
-        Makes a user template private. The caller checks the user and holds the
-        lock of the root.
+        Makes a user template private. The root is saved once. The caller checks
+        the user and holds the lock of the root.
 
         :param root: The root of the template, locked.
-        :param update_fields: The fields of the root the caller changed.
         :return: The id of the revision that was listed, otherwise the id of the
             revision withdrawn from review, otherwise None.
         """
 
         self.drop_scheduled_make_public(root)
+        root_fields = []
         public_revision_id = root.public_revision_id
         if public_revision_id is not None:
-            self.withdraw_listing(root)
-        root_fields = list(update_fields)
+            root.public_revision = None
+            root_fields.append("public_revision")
         withdrawn = self.withdraw_review(root)
         if withdrawn is root:
             root_fields.append("review_state")
@@ -1373,17 +1446,46 @@ class UserTemplateHandler:
             return public_revision_id
         return withdrawn.id if withdrawn is not None else None
 
+    def _check_seen_revision(self, latest: Template, revision_id: int) -> None:
+        """
+        Checks that an admin blocks or unblocks the template they saw. Of a
+        blocked template, the revision they saw must be its latest one, so that
+        they act on its latest edit. Of a template that isn't blocked, it must be
+        one of its revisions, because the admin may block it from the row or page
+        of an older one.
+
+        :param latest: The latest revision of the template, with its root locked.
+        :param revision_id: The id of the revision the admin saw.
+        :raises TemplateUpdated: If the revision isn't one of the template, or not
+            the latest one of a blocked template.
+        """
+
+        root = latest.get_root()
+        if root.blocked_at is None:
+            seen = Template.objects.filter_by_root(id=root.id).filter(id=revision_id)
+            if seen.exists():
+                return
+        elif revision_id == latest.id:
+            return
+        raise TemplateUpdated(
+            f"The revision {revision_id} isn't the one of the template {root.id} "
+            "the admin saw."
+        )
+
     def block_template(
-        self, admin: AbstractUser, template_id: int, reason: str
+        self, admin: AbstractUser, template_id: int, revision_id: int, reason: str
     ) -> Template:
         """
-        Blocks a user template. Must run in a transaction.
+        Blocks a user template in any state. Blocking it again changes the reason
+        and who blocked it, and moves when. Must run in a transaction.
 
         :param admin: The instance admin who blocks the template.
         :param template_id: The id of the template, which is its root.
-        :param reason: Why the template is blocked.
+        :param revision_id: The id of the revision the admin saw, see
+            `_check_seen_revision`.
+        :param reason: Why the template is blocked, which its author sees.
         :raises TemplateBlockReasonRequired: If the reason is blank.
-        :raises: See `_get_template_for_moderation`.
+        :raises: See `_get_template_for_moderation` and `_check_seen_revision`.
         :return: The latest revision of the template.
         """
 
@@ -1391,37 +1493,89 @@ class UserTemplateHandler:
             raise TemplateBlockReasonRequired("A block reason is required.")
 
         root = self._get_template_for_moderation(admin, template_id)
-        if root.blocked_at is None:
-            root.blocked_at = timezone.now()
+        latest = self.get_latest_revision_of_locked_root(root)
+        self._check_seen_revision(latest, revision_id)
+        root.blocked_at = timezone.now()
         root.blocked_by = admin
         root.blocked_reason = reason
         root.save(update_fields=["blocked_at", "blocked_by", "blocked_reason"])
-        return self.get_latest_revision_of_locked_root(root)
+        return latest
 
     def unblock_template(
-        self, admin: AbstractUser, template_id: int
-    ) -> tuple[Template, bool]:
+        self, admin: AbstractUser, template_id: int, revision_id: int
+    ) -> tuple[Template, Optional[UnblockOutcome]]:
         """
-        Unblocks a user template. Must run in a transaction.
+        Lifts the block of a user template, which restores the state it had before
+        the block, private link included. Two things differ: a listed template
+        gets its latest revision listed, the one the admin saw, approved by the
+        admin, unless an admin rejected it; and when approval isn't required, a
+        pending revision of a template without an open rejection is approved, as
+        `approve_pending_revisions` does. Unblocking a template that isn't blocked
+        changes nothing, whatever revision the admin saw. Must run in a
+        transaction.
 
         :param admin: The instance admin who unblocks the template.
         :param template_id: The id of the template, which is its root.
-        :raises: See `_get_template_for_moderation`.
-        :return: The latest revision of the template, and whether it was blocked.
+        :param revision_id: The id of the revision the admin saw, see
+            `_check_seen_revision`.
+        :raises TemplateHasNoContent: If the latest revision is to be listed but
+            has no content.
+        :raises: See `_get_template_for_moderation` and `_check_seen_revision`.
+        :return: The latest revision of the template, and what it returned to,
+            None if it wasn't blocked.
         """
 
+        require_approval = self.read_require_approval()
         root = self._get_template_for_moderation(admin, template_id)
         latest = self.get_latest_revision_of_locked_root(root)
         if root.blocked_at is None:
-            return latest, False
+            return latest, None
+        self._check_seen_revision(latest, revision_id)
 
-        root.blocked_at = None
-        root.blocked_by = None
-        root.blocked_reason = ""
-        self.make_template_private(
-            root, update_fields=["blocked_at", "blocked_by", "blocked_reason"]
+        unblocked = {"blocked_at": None, "blocked_by": None, "blocked_reason": ""}
+        fields = {}
+        if (
+            root.public_revision_id not in (None, latest.id)
+            and latest.review_state != Template.ReviewState.REJECTED
+        ):
+            self._check_has_content(latest)
+            listed = latest
+            fields["submitted_on"] = Coalesce(F("submitted_on"), Value(timezone.now()))
+        elif not require_approval:
+            listed = (
+                Template.objects.open_reviews()
+                .filter_by_root(id=root.id)
+                .approvable_without_review()
+                .first()
+            )
+        else:
+            listed = None
+
+        if listed is None:
+            for field, value in unblocked.items():
+                setattr(root, field, value)
+            root.save(update_fields=list(unblocked))
+        else:
+            has_reject_reason = (
+                Template.objects.filter(id=root.id)
+                .alias(family_id=F("id"))
+                .filter(self._has_reject_reason())
+                .exists()
+            )
+            self._approve_revisions(
+                [(listed.id, listed.root_id)],
+                admin,
+                rejected_template_ids=[root.id] if has_reject_reason else [],
+                root_fields=unblocked,
+                **fields,
+            )
+        root.refresh_from_db()
+        state, _ = self.get_template_state(latest)
+        return latest, UnblockOutcome(
+            UserTemplateState(state),
+            listed.id if listed else None,
+            self.is_listed(root),
         )
-        return latest, True
 
     def drop_scheduled_make_public(self, root: Template) -> None:
         """

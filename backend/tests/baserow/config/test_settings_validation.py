@@ -40,11 +40,19 @@ def test_non_positive_realtime_replay_retention_is_rejected(retention_hours: str
 
 
 @pytest.mark.parametrize(
-    "configured,expected", [(None, "None"), ("", "None"), ("0", "None"), ("10", "10")]
+    "name",
+    [
+        "BASEROW_AGENT_MAX_ACTIVE_RUNS_PER_WORKSPACE",
+        "BASEROW_AGENT_MAX_ACTIVE_RUNS_PER_USER",
+        "BASEROW_AGENT_MAX_ACTIONS_PER_AGENT",
+    ],
 )
-def test_agent_workspace_reply_limit_is_optional(configured: str | None, expected: str):
+@pytest.mark.parametrize(
+    "configured,expected",
+    [(None, "None"), ("", "None"), ("0", "None"), ("-1", "None"), ("10", "10")],
+)
+def test_agent_limits_are_optional(name: str, configured: str | None, expected: str):
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    name = "BASEROW_AGENT_MAX_ACTIVE_RUNS_PER_WORKSPACE"
     if configured is None:
         env.pop(name, None)
     else:
@@ -54,8 +62,7 @@ def test_agent_workspace_reply_limit_is_optional(configured: str | None, expecte
         [
             sys.executable,
             "-c",
-            "from baserow.config.settings import base; "
-            "print(base.BASEROW_AGENT_MAX_ACTIVE_RUNS_PER_WORKSPACE)",
+            f"from baserow.config.settings import base; print(base.{name})",
         ],
         check=False,
         capture_output=True,
@@ -100,9 +107,10 @@ AGENT_TRIGGER_LIMIT_VARIABLES = (
     "BASEROW_AGENT_TRIGGER_AGENT_RATE_LIMITS",
     "BASEROW_AGENT_TRIGGER_MAX_QUEUED_RUNS",
     "BASEROW_AGENT_TRIGGER_MAX_PARALLEL_RUNS",
+    "BASEROW_AGENT_TRIGGER_MAX_BATCHES_PER_EVENT",
 )
 DEFAULT_AGENT_TRIGGER_LIMITS = (
-    "((10, 5), (30, 300), (100, 3600)) ((20, 60), (300, 3600)) 10 5"
+    "((10, 5), (30, 300), (100, 3600)) ((20, 60), (300, 3600)) 10 5 10"
 )
 
 
@@ -119,7 +127,8 @@ def _read_agent_trigger_limits(**configured: str) -> subprocess.CompletedProcess
             "print(base.AGENT_TRIGGER_RATE_LIMITS, "
             "base.AGENT_TRIGGER_AGENT_RATE_LIMITS, "
             "base.AGENT_TRIGGER_MAX_QUEUED_RUNS, "
-            "base.AGENT_TRIGGER_MAX_PARALLEL_RUNS)",
+            "base.AGENT_TRIGGER_MAX_PARALLEL_RUNS, "
+            "base.AGENT_TRIGGER_MAX_BATCHES_PER_EVENT)",
         ],
         check=False,
         capture_output=True,
@@ -139,8 +148,9 @@ def _read_agent_trigger_limits(**configured: str) -> subprocess.CompletedProcess
                 "BASEROW_AGENT_TRIGGER_AGENT_RATE_LIMITS": ",",
                 "BASEROW_AGENT_TRIGGER_MAX_QUEUED_RUNS": "1",
                 "BASEROW_AGENT_TRIGGER_MAX_PARALLEL_RUNS": "0",
+                "BASEROW_AGENT_TRIGGER_MAX_BATCHES_PER_EVENT": "0",
             },
-            "((1, 3600),) () 1 0",
+            "((1, 3600),) () 1 0 1",
         ),
     ],
     ids=["unset", "empty_keeps_default", "custom_and_disabled"],

@@ -22,6 +22,7 @@ class DispatchContext(RuntimeFormulaContext, ABC):
         "event_payload",
         "actor",
         "workspace",
+        "resolved_values",
     ]
 
     """
@@ -46,6 +47,13 @@ class DispatchContext(RuntimeFormulaContext, ABC):
     # endpoints that use both keep working.
     external_request_timeouts = 1
 
+    # Whether an external request only follows a redirect that stays on its
+    # host, without going from https to http. Its headers and body would go
+    # along to wherever the redirect points, unseen by whoever approved where
+    # the request goes. False by default: builder and automation follow every
+    # redirect, as they always have.
+    redirects_stay_on_host = False
+
     def __init__(
         self,
         workspace: Optional["Workspace"] = None,
@@ -56,6 +64,7 @@ class DispatchContext(RuntimeFormulaContext, ABC):
         keep_sample_data_on_error: bool = False,
         force_outputs: Dict[int, str] = None,
         actor: Optional[AbstractUser] = None,
+        resolved_values: Optional[Dict[int, Dict[str, Any]]] = None,
     ):
         """
         This abstract base class provides context needed by specific
@@ -75,6 +84,10 @@ class DispatchContext(RuntimeFormulaContext, ABC):
         :param actor: The user this dispatch acts as, for services that have no
             integration to supply one.
         :param workspace: The workspace this dispatch is running in.
+        :param resolved_values: Mapping of service IDs and the formula values
+            already resolved for them. Such a service is dispatched with these
+            values rather than resolving its formulas again, so that what was
+            shown before the dispatch is exactly what it sends.
         """
 
         self.cache = {}  # can be used by data providers to save queries
@@ -86,7 +99,12 @@ class DispatchContext(RuntimeFormulaContext, ABC):
         self.event_payload = event_payload
         self.actor = actor
         self.workspace = workspace
+        self.resolved_values = resolved_values
         super().__init__()
+
+    def get_runtime_filters(self, service: Service) -> list[dict]:
+        """Return additional groups applied with AND after the stored service filters."""
+        return []
 
     def range(self, service: Service) -> tuple[int, int | None]:
         """

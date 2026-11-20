@@ -1,4 +1,5 @@
 import { AGENT_APPLICATION_TYPE } from '@baserow/modules/agent/constants'
+import { FF_AGENT_BUILDER } from '@baserow/modules/core/plugins/featureFlags'
 import { isSecureURL } from '@baserow/modules/core/utils/string'
 import { logoutAndRedirectToLogin } from '@baserow/modules/core/utils/auth'
 import {
@@ -593,6 +594,14 @@ export class RealTimeHandler {
       Object.prototype.hasOwnProperty.call(data, 'type') &&
       Object.prototype.hasOwnProperty.call(this.events, data.type)
     ) {
+      if (
+        (data.type.startsWith('agent_') ||
+          data.run_type === AGENT_APPLICATION_TYPE ||
+          data.parameters?.run_type === AGENT_APPLICATION_TYPE) &&
+        !this.context.app.$featureFlagIsEnabled(FF_AGENT_BUILDER)
+      ) {
+        return
+      }
       for (const callback of this.events[data.type]) {
         callback(this.context, data)
       }
@@ -861,16 +870,29 @@ export class RealTimeHandler {
       })
     })
 
-    this.registerEvent('agent_created', ({ store }, data) => {
-      store.dispatch('agent/forceCreate', data.agent)
-    })
-    this.registerEvent('agent_updated', ({ store }, data) => {
-      store.dispatch('agent/forceUpdate', data.agent)
-    })
-    this.registerEvent('agent_deleted', ({ store }, data) => {
-      store.dispatch('agent/forceDelete', {
+    this.registerEvent('workspace_identity_updated', ({ store }, data) => {
+      store.commit('workspace/UPSERT_WORKSPACE_IDENTITY', {
         workspaceId: data.workspace_id,
-        agentId: data.agent_id,
+        identity: data.identity,
+      })
+    })
+    this.registerEvent('workspace_identity_deleted', ({ store }, data) => {
+      store.commit('workspace/DELETE_WORKSPACE_IDENTITY', {
+        workspaceId: data.workspace_id,
+        identityId: data.identity_id,
+      })
+    })
+
+    this.registerEvent('identity_created', ({ store }, data) => {
+      store.dispatch('identity/forceCreate', data.identity)
+    })
+    this.registerEvent('identity_updated', ({ store }, data) => {
+      store.dispatch('identity/forceUpdate', data.identity)
+    })
+    this.registerEvent('identity_deleted', ({ store }, data) => {
+      store.dispatch('identity/forceDelete', {
+        workspaceId: data.workspace_id,
+        identityId: data.identity_id,
       })
     })
 

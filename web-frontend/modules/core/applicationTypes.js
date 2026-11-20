@@ -1,5 +1,6 @@
 import { Registerable } from '@baserow/modules/core/registry'
 import ApplicationForm from '@baserow/modules/core/components/application/ApplicationForm'
+import CreateApplicationModal from '@baserow/modules/core/components/application/CreateApplicationModal'
 
 /**
  * The application type base class that can be extended when creating a plugin
@@ -59,6 +60,15 @@ export class ApplicationType extends Registerable {
   }
 
   /**
+   * The name used for a trashed application of this type in the trash, for
+   * example in "{user} deleted {type} {title}".
+   */
+  getTrashItemTypeName() {
+    const { $i18n: i18n } = this.app
+    return i18n.t('trashType.application')
+  }
+
+  /**
    * The form component that will be rendered when creating a new instance of
    * this application. By default the ApplicationForm component is returned, but
    * this only contains a name field. If custom fields are required upon
@@ -66,6 +76,15 @@ export class ApplicationType extends Registerable {
    */
   getApplicationFormComponent() {
     return ApplicationForm
+  }
+
+  /**
+   * The modal that creates an application of this type. It receives the
+   * `applicationType` and `workspace` props, emits `created` with the new
+   * application and exposes `toggle`, `show` and `hide`.
+   */
+  getCreateModalComponent() {
+    return CreateApplicationModal
   }
 
   /**

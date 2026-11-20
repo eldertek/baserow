@@ -63,6 +63,7 @@ from baserow.core.telemetry.utils import baserow_trace_handler
 from baserow.core.trash.exceptions import RelatedTableTrashedException
 from baserow.core.trash.handler import TrashHandler
 from baserow.core.trash.registries import trash_item_type_registry
+from baserow.core.user.identity import collaborator_q
 from baserow.core.utils import (
     ChildProgressBuilder,
     extract_allowed,
@@ -218,9 +219,12 @@ class FieldHandler:
         ).prefetch_related(
             Prefetch(
                 "table__database__workspace__users",
-                queryset=User.objects.filter(profile__to_be_deleted=False).order_by(
-                    "first_name"
-                ),
+                queryset=User.objects_and_identities.filter(
+                    collaborator_q(include_identities=True),
+                    profile__to_be_deleted=False,
+                )
+                .select_related("profile")
+                .order_by("first_name"),
                 to_attr="available_collaborators",
             ),
             "select_options",
@@ -816,9 +820,13 @@ class FieldHandler:
                 using=DEFAULT_DB_ALIAS
             )
 
-        # Write-only fields can't have view default values.
-        if baserow_field_type_changed and to_field_type.write_only:
-            ViewDefaultValue.objects.filter(field_id=field.id).delete()
+        view_ids_without_default_value = []
+        if to_field_type.should_delete_view_default_values(old_field, field):
+            default_values = ViewDefaultValue.objects.filter(field_id=field.id)
+            view_ids_without_default_value = list(
+                default_values.values_list("view_id", flat=True)
+            )
+            default_values.delete()
 
         to_field_type.after_update(
             old_field,
@@ -875,6 +883,7 @@ class FieldHandler:
             field_type_changed=baserow_field_type_changed,
             user=user,
         )
+        ViewHandler().send_default_values_changed(view_ids_without_default_value)
         update_collector.send_additional_field_updated_signals()
 
         if return_updated_fields:

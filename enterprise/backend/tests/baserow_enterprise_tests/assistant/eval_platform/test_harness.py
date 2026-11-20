@@ -32,6 +32,7 @@ from baserow.core.ai_provider.constants import (
     AI_PROVIDER_FEATURE_MODE_MODEL,
 )
 from baserow.core.ai_provider.handler import AIProviderHandler
+from baserow.core.generative_ai.lifecycle import run_agent_sync_with_model
 from baserow_enterprise.assistant.agents import main_agent
 from baserow_enterprise.assistant.assistant import build_agent_run_context
 from baserow_enterprise.assistant.deps import AgentMode, AssistantDeps, ToolHelpers
@@ -69,6 +70,10 @@ from baserow_enterprise.assistant.tools.routing import (
     mode_redirect_message,
 )
 from baserow_enterprise.assistant.tools.toolset import InlineRefsToolset
+from baserow_enterprise.features import RBAC
+from baserow_enterprise_tests.enterprise_fixtures import EnterpriseFixtures
+from baserow_premium.license.handler import LicenseHandler
+from baserow_premium.license.models import License
 
 
 @pytest.mark.django_db
@@ -647,6 +652,45 @@ class TestRunCase:
         assert results[1].name == "has-no-tool-calls"
         assert results[1].passed is True
 
+    def test_instance_licence_added_by_a_scenario_ends_with_its_case(self, settings):
+        settings.DEBUG = True
+        settings.BASEROW_CACHE_TTL_SECONDS = 120
+        fixtures = make_fixtures()
+        user = fixtures.create_user()
+        workspace = fixtures.create_workspace(user=user)
+
+        def has_rbac() -> bool:
+            return LicenseHandler.workspace_has_feature(RBAC, workspace)
+
+        @registry.register_scenario("harness-test-enterprise")
+        def _build(fixtures) -> EvalScenario:
+            fixtures.enable_enterprise()
+            return EvalScenario(user=user, workspace=workspace, ui_context=None)
+
+        during_case = []
+
+        def _checks(case, scenario, output):
+            during_case.append(has_rbac())
+            return []
+
+        case = EvalCase(
+            id="harness-test/enterprise",
+            dataset="harness-test",
+            prompt="say hi",
+            scenario="harness-test-enterprise",
+            checks=_checks,
+        )
+        model = TestModel(custom_output_text="hi", call_tools=[])
+
+        assert not has_rbac()
+        run_case(case, model)
+        assert during_case == [True]
+        assert not has_rbac()
+
+        own_licence = EnterpriseFixtures().enable_enterprise()
+        run_case(case, model)
+        assert License.objects.get() == own_licence
+
     def test_scenario_receives_case_mode_and_ui_context(self, monkeypatch):
         """The case's mode and the scenario's ui_context must reach the run's
         deps — otherwise every case silently runs in DATABASE mode with no
@@ -935,7 +979,7 @@ class TestCaseToolCleanup:
         monkeypatch.setenv("BASEROW_EVAL_CASE_TIMEOUT", "0.1")
         monkeypatch.setattr(harness, "_cleanup_error", None)
         monkeypatch.setattr(harness, "load_all", lambda: None)
-        monkeypatch.setattr(harness, "make_fixtures", lambda: None)
+        monkeypatch.setattr(harness, "make_fixtures", MagicMock())
         scenario = SimpleNamespace(user=None, workspace=None, ui_context=None)
         monkeypatch.setattr(harness, "get_scenario", lambda _: lambda _: scenario)
         profile = SimpleNamespace(get_settings=lambda _: {})
@@ -1090,6 +1134,32 @@ class TestCaseToolCleanup:
                 asyncio.gather(*cleanup_tasks, return_exceptions=True)
             )
         assert model.closed
+
+    def test_a_timed_out_case_starts_no_new_model_call(self, isolated_case):
+        requests: list[list] = []
+
+        # Async on purpose: a sync one would be refused by the draining executor.
+        async def respond(messages, info) -> ModelResponse:
+            requests.append(messages)
+            return ModelResponse(parts=[TextPart(content="Done")])
+
+        def tool_with_a_sub_agent(ctx: RunContext[AssistantDeps]) -> str:
+            helpers = ctx.deps.tool_helpers
+            deadline = time.monotonic() + 3
+            while not helpers.is_cancelled and time.monotonic() < deadline:
+                time.sleep(0.01)
+            sub_agent_run = run_agent_sync_with_model(
+                Agent(output_type=str),
+                "Help the tool",
+                model=RetryingModel(FunctionModel(respond)),
+            )
+            return sub_agent_run.output
+
+        case = isolated_case(tool_with_a_sub_agent)
+        with pytest.raises(EvalCaseTimeout):
+            run_case(case, TestModel())
+
+        assert requests == []
 
 
 @pytest.mark.parametrize("value", ["", "   "])

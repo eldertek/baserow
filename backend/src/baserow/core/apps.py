@@ -12,6 +12,10 @@ class CoreConfig(AppConfig):
     name = "baserow.core"
 
     def ready(self):
+        from baserow.core.user.managers import install_user_managers
+
+        install_user_managers()
+
         import pydantic_ai
 
         # Otherwise the first uninstrumented agent run prints a Logfire promo to stderr.
@@ -39,9 +43,9 @@ class CoreConfig(AppConfig):
 
         trash_item_type_registry.register(WorkspaceTrashableItemType())
         trash_item_type_registry.register(ApplicationTrashableItemType())
-        from .agents.trash_types import AgentTrashableItemType
+        from .identities.trash_types import IdentityTrashableItemType
 
-        trash_item_type_registry.register(AgentTrashableItemType())
+        trash_item_type_registry.register(IdentityTrashableItemType())
 
         from baserow.core.formula.registries import formula_runtime_function_registry
         from baserow.core.formula.runtime_formula_types import (
@@ -222,22 +226,21 @@ class CoreConfig(AppConfig):
 
         from baserow.core.registries import subject_type_registry
 
-        from .agents.subjects import AgentSubjectType
         from .subjects import AnonymousUserSubjectType, UserSubjectType
         from .user_sources.subjects import UserSourceUserSubjectType
 
         subject_type_registry.register(UserSubjectType())
         subject_type_registry.register(AnonymousUserSubjectType())
         subject_type_registry.register(UserSourceUserSubjectType())
-        subject_type_registry.register(AgentSubjectType())
 
-        from .agents.operations import (
-            CreateAgentOperationType,
-            DeleteAgentOperationType,
-            ListAgentsWorkspaceOperationType,
-            UpdateAgentOperationType,
-        )
         from .ai_provider.operations import ManageAIProvidersOperationType
+        from .identities.operations import (
+            BindIdentityOperationType,
+            CreateIdentityOperationType,
+            DeleteIdentityOperationType,
+            ListIdentitiesWorkspaceOperationType,
+            UpdateIdentityOperationType,
+        )
         from .notifications.operations import (
             ClearNotificationsOperationType,
             ListNotificationsOperationType,
@@ -326,10 +329,11 @@ class CoreConfig(AppConfig):
         operation_type_registry.register(RestoreApplicationOperationType())
         operation_type_registry.register(RestoreWorkspaceOperationType())
         operation_type_registry.register(ReadApplicationOperationType())
-        operation_type_registry.register(ListAgentsWorkspaceOperationType())
-        operation_type_registry.register(CreateAgentOperationType())
-        operation_type_registry.register(UpdateAgentOperationType())
-        operation_type_registry.register(DeleteAgentOperationType())
+        operation_type_registry.register(ListIdentitiesWorkspaceOperationType())
+        operation_type_registry.register(CreateIdentityOperationType())
+        operation_type_registry.register(UpdateIdentityOperationType())
+        operation_type_registry.register(DeleteIdentityOperationType())
+        operation_type_registry.register(BindIdentityOperationType())
 
         from baserow.core.actions import (
             AcceptWorkspaceInvitationActionType,
@@ -382,6 +386,16 @@ class CoreConfig(AppConfig):
         action_type_registry.register(ExportApplicationsActionType())
         action_type_registry.register(ImportApplicationsActionType())
         action_type_registry.register(UpdateAdminSettingsActionType())
+
+        from baserow.core.identities.actions import (
+            CreateIdentityActionType,
+            DeleteIdentityActionType,
+            UpdateIdentityActionType,
+        )
+
+        action_type_registry.register(CreateIdentityActionType())
+        action_type_registry.register(UpdateIdentityActionType())
+        action_type_registry.register(DeleteIdentityActionType())
 
         from baserow.core.snapshots.actions import (
             CreateSnapshotActionType,
@@ -442,13 +456,18 @@ class CoreConfig(AppConfig):
         )
         from baserow.core.mcp.groups import (
             WorkspaceReadMCPToolGroup,
+            WorkspaceUndoMCPToolGroup,
             mcp_tool_group_registry,
         )
         from baserow.core.mcp.registries import mcp_tool_registry
         from baserow.core.mcp.search.tools import SearchWorkspaceMcpTool
+        from baserow.core.mcp.undo.tools import RedoMcpTool, UndoMcpTool
 
         mcp_tool_group_registry.register(WorkspaceReadMCPToolGroup())
+        mcp_tool_group_registry.register(WorkspaceUndoMCPToolGroup())
         mcp_tool_registry.register(SearchWorkspaceMcpTool())
+        mcp_tool_registry.register(UndoMcpTool())
+        mcp_tool_registry.register(RedoMcpTool())
 
         action_type_registry.register(CreateMCPEndpointActionType())
         action_type_registry.register(UpdateMCPEndpointActionType())
@@ -536,9 +555,13 @@ class CoreConfig(AppConfig):
             UnreadUserNotificationsCountPermissionsDataType,
         )
         from baserow.api.user.registries import user_data_registry
-        from baserow.api.user.user_data_types import GlobalPermissionsDataType
+        from baserow.api.user.user_data_types import (
+            GlobalPermissionsDataType,
+            UserFeatureFlagsDataType,
+        )
 
         user_data_registry.register(GlobalPermissionsDataType())
+        user_data_registry.register(UserFeatureFlagsDataType())
         user_data_registry.register(UnreadUserNotificationsCountPermissionsDataType())
 
         from baserow.core.preference_types import (
@@ -665,6 +688,7 @@ class CoreConfig(AppConfig):
 
             patch_user_model_str()
 
+        import baserow.core.identities.receivers  # noqa: F401
         import baserow.core.last_viewed.receivers  # noqa: F401
         import baserow.core.mcp.receivers  # noqa: F401
         import baserow.core.receivers  # noqa: F401

@@ -33,7 +33,10 @@
         size="small"
         @update:active-index="choosePreset"
       />
-      <div class="agent-workspace-tools__ask">
+      <div
+        v-if="presetIndex === PRESET.EVERYTHING"
+        class="agent-workspace-tools__ask"
+      >
         <div class="agent-workspace-tools__ask-text">
           <div class="agent-workspace-tools__ask-title">
             {{ $t('agent.askBeforeChanges') }}
@@ -77,7 +80,7 @@
           {{
             $t(disabledReason ? 'agent.toolsSelected' : 'agent.toolsSummary', {
               on: countIn(group, allowedTools),
-              total: group.tools.length,
+              total: group.tools.filter((tool) => !tool.deactivated).length,
             })
           }}
           <template v-if="countIn(group, askFirstTools)">
@@ -103,6 +106,7 @@
       :ask-first-tools="askFirstTools"
       :agent-name="agentName"
       :editable="editable"
+      :workspace="workspace"
       @save="emit('update', $event)"
     />
   </div>
@@ -110,12 +114,14 @@
 
 <script setup>
 import { useNuxtApp } from '#app'
-import { computed, ref, useId } from 'vue'
+import { computed, inject, ref, useId } from 'vue'
+import { useStore } from 'vuex'
 import { useI18n } from 'vue-i18n'
 import SegmentControl from '@baserow/modules/core/components/SegmentControl'
 import {
   groupAgentTools,
   nextAskFirst,
+  usableAgentTools,
 } from '@baserow/modules/agent/agentTools'
 import AgentToolPermissionsModal from '@baserow/modules/agent/components/configuration/AgentToolPermissionsModal'
 
@@ -132,14 +138,21 @@ const emit = defineEmits(['update'])
 const { t } = useI18n()
 const askDescriptionId = useId()
 const { $registry } = useNuxtApp()
+const store = useStore()
+const agent = inject('agentApplication')
 
 const permissions = ref(null)
+const workspace = computed(() =>
+  agent.value ? store.getters['workspace/get'](agent.value.workspace.id) : null
+)
 const groups = computed(() =>
   groupAgentTools(props.availableTools, $registry, t)
 )
-const allTools = computed(() => props.availableTools.map((tool) => tool.name))
+// The presets pick among the tools the workspace can use.
+const usableTools = computed(() => usableAgentTools(props.availableTools))
+const allTools = computed(() => usableTools.value.map((tool) => tool.name))
 const readTools = computed(() =>
-  props.availableTools
+  usableTools.value
     .filter((tool) => !tool.changes_data)
     .map((tool) => tool.name)
 )
@@ -167,13 +180,14 @@ const presets = computed(() => [
   { label: t('agent.toolsCustom') },
 ])
 
+const PRESET = { EVERYTHING: 0, READ_ONLY: 1, CUSTOM: 2 }
 const isExactly = (names) =>
   names.length === props.allowedTools.length &&
   names.every((name) => props.allowedTools.includes(name))
 const presetIndex = computed(() => {
-  if (isExactly(allTools.value)) return 0
-  if (isExactly(readTools.value)) return 1
-  return 2
+  if (isExactly(allTools.value)) return PRESET.EVERYTHING
+  if (isExactly(readTools.value)) return PRESET.READ_ONLY
+  return PRESET.CUSTOM
 })
 const countIn = (group, names) =>
   group.tools.filter((tool) => names.includes(tool.name)).length
@@ -192,8 +206,8 @@ function allow(names) {
 
 function choosePreset(index) {
   if (!props.editable) return
-  if (index === 0) allow(allTools.value)
-  else if (index === 1) allow(readTools.value)
+  if (index === PRESET.EVERYTHING) allow(allTools.value)
+  else if (index === PRESET.READ_ONLY) allow(readTools.value)
   else permissions.value.show()
 }
 

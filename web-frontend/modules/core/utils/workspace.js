@@ -1,8 +1,24 @@
 import { ConcurrentPriorityTaskQueue } from '@baserow/modules/core/utils/queue'
+import {
+  FF_AGENT_BUILDER,
+  FF_IDENTITIES,
+} from '@baserow/modules/core/plugins/featureFlags'
+import { AGENT_APPLICATION_TYPE } from '@baserow/modules/agent/constants'
 
-export const getWorkspaceMembersCount = (workspace, canListAgents) =>
+export const visibleApplications = (app, applications) =>
+  (applications ?? []).filter(
+    ({ type }) =>
+      type !== AGENT_APPLICATION_TYPE ||
+      app.$featureFlagIsEnabled(FF_AGENT_BUILDER)
+  )
+
+export const canListIdentities = (app, workspace) =>
+  app.$featureFlagIsEnabled(FF_IDENTITIES) &&
+  app.$hasPermission('workspace.list_identities', workspace, workspace.id)
+
+export const getWorkspaceMembersCount = (workspace, canListIdentities) =>
   (workspace.users?.length || 0) +
-  (canListAgents ? workspace.agents_count || 0 : 0)
+  (canListIdentities ? workspace.identities_count || 0 : 0)
 
 /**
  * Fetches the workspaces and applications of the authenticated user if that hasn't

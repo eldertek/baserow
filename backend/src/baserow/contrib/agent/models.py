@@ -2,7 +2,10 @@ from django.conf import settings
 from django.db import models
 from django.db.models import Q
 
-from baserow.contrib.agent.constants import AGENT_TRIGGER_NAME_MAX_LENGTH
+from baserow.contrib.agent.constants import (
+    AGENT_TRIGGER_DEFAULT_BATCH_SIZE,
+    AGENT_TRIGGER_NAME_MAX_LENGTH,
+)
 from baserow.core.formula.field import FormulaField
 from baserow.core.mixins import (
     BigAutoFieldMixin,
@@ -34,6 +37,8 @@ class AgentApplication(Application):
     run_as_subject_id = models.BigIntegerField(null=True, blank=True, db_default=None)
     # Searches run at the AI provider, which charges for them.
     web_search_enabled = models.BooleanField(default=False, db_default=False)
+    # Pages are fetched by Baserow itself, so every model can open them.
+    web_fetch_enabled = models.BooleanField(default=False, db_default=False)
 
 
 class AgentAllowedTool(models.Model):
@@ -49,6 +54,33 @@ class AgentAllowedTool(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["agent", "name"], name="agent_allowed_tool_unique_name"
+            )
+        ]
+
+
+class AgentAction(TrashableModelMixin, CreatedAndUpdatedOnMixin, models.Model):
+    """One named tool backed by its own configured integration service."""
+
+    agent = models.ForeignKey(
+        AgentApplication, on_delete=models.CASCADE, related_name="actions"
+    )
+    service = models.OneToOneField(
+        Service, on_delete=models.CASCADE, related_name="agent_action"
+    )
+    name = models.CharField(max_length=64)
+    description = models.TextField(blank=True, default="")
+    inputs = models.JSONField(default=list, blank=True)
+    enabled = models.BooleanField(default=True, db_default=True)
+    # An action acts outside Baserow, so like a tool that changes data it asks first.
+    ask_first = models.BooleanField(default=True, db_default=True)
+
+    class Meta:
+        ordering = ("id",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=["agent", "name"],
+                condition=Q(trashed=False),
+                name="agent_action_unique_live_name",
             )
         ]
 
@@ -70,6 +102,8 @@ class AgentTrigger(TrashableModelMixin, CreatedAndUpdatedOnMixin, models.Model):
         AGENT_RATE_LIMITED = "agent_rate_limited", "Agent rate limited"
         PREVIOUS_RUNNING = "previous_running", "Previous run still going"
         QUEUE_FULL = "queue_full", "Queue full"
+        NO_ACCESS = "no_access", "No access"
+        EVENT_TOO_LARGE = "event_too_large", "Event too large"
 
     agent = models.ForeignKey(
         AgentApplication, on_delete=models.CASCADE, related_name="triggers"
@@ -88,6 +122,11 @@ class AgentTrigger(TrashableModelMixin, CreatedAndUpdatedOnMixin, models.Model):
         choices=OnOverlap.choices,
         default=OnOverlap.SKIP,
         db_default=OnOverlap.SKIP,
+    )
+    # Records of a list payload one conversation receives; other payloads ignore it.
+    batch_size = models.PositiveSmallIntegerField(
+        default=AGENT_TRIGGER_DEFAULT_BATCH_SIZE,
+        db_default=AGENT_TRIGGER_DEFAULT_BATCH_SIZE,
     )
     # A skip is shown while it is newer than the last accepted firing.
     last_fired_on = models.DateTimeField(null=True, blank=True)
@@ -259,8 +298,8 @@ class AgentToolApproval(BigAutoFieldMixin, models.Model):
         blank=True,
         default="",
         db_default="",
-        help_text="For an MCP tool, its server, account and definition when the "
-        "call was held. An approved call only runs while they're the same.",
+        help_text="For an MCP tool or an action, a digest of what it was when the "
+        "call was held. An approved call only runs while it's the same.",
     )
     status = models.CharField(
         max_length=16,
@@ -310,6 +349,8 @@ class AgentReplyTranscript(BigAutoFieldMixin, models.Model):
     paused_conversation = models.JSONField(null=True)
     # A provider that refused web search would refuse the resume too.
     paused_web_search = models.BooleanField(default=False, db_default=False)
+    # Its history may hold page fetches, so a resume offers the tool only if it did.
+    paused_web_fetch = models.BooleanField(default=False, db_default=False)
     # Held calls were named and approved as this identity, so they never run as another.
     paused_run_as_subject_type = models.CharField(max_length=255, null=True)
     paused_run_as_subject_id = models.BigIntegerField(null=True)

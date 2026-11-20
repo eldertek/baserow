@@ -56,7 +56,6 @@ from baserow.core.exceptions import (
     WorkspaceDoesNotExist,
     is_max_lock_exceeded_exception,
 )
-from baserow.core.feature_flags import FF_USER_TEMPLATES, feature_flag_is_enabled
 from baserow.core.handler import CoreHandler
 from baserow.core.import_export.exceptions import (
     ImportExportApplicationIdsNotFound,
@@ -83,6 +82,7 @@ from baserow.core.operations import (
     ListApplicationsWorkspaceOperationType,
 )
 from baserow.core.service import CoreService
+from baserow.core.user_files.handler import delete_new_files_on_error
 from baserow.core.user_templates.exceptions import (
     TemplateBlocked,
     TemplateHasNoContent,
@@ -234,9 +234,7 @@ class InstallTemplateJobType(JobType):
 
         # Only the root is looked up, so the id of a revision is unknown too.
         root = UserTemplateHandler().get_user_template_root(values["template_id"])
-        # With the feature off, a user template is looked up like an official one
-        # below, which doesn't find it.
-        if root is not None and feature_flag_is_enabled(FF_USER_TEMPLATES):
+        if root is not None:
             # The resolved revision is pinned, so that an update of the template
             # before the job runs doesn't change what's installed.
             template = UserTemplateHandler().get_installable_revision(
@@ -326,7 +324,7 @@ class InstallTemplateJobType(JobType):
                 job.template,
                 progress_builder=progress.create_child_builder(represents_progress=50),
             )
-            with transaction.atomic():
+            with delete_new_files_on_error(), transaction.atomic():
                 installed_applications = action_type_registry.get_by_type(
                     InstallTemplateActionType
                 ).do(

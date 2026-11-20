@@ -73,7 +73,14 @@ class AgentRunAsSerializer(serializers.Serializer):
     )
 
 
-class AgentRunAsSubjectsQueryParamsSerializer(serializers.Serializer):
+class AgentRunAsOptionSerializer(serializers.Serializer):
+    """A selectable identity returned by the Agent's scoped run-as endpoint."""
+
+    id = serializers.IntegerField(read_only=True)
+    name = serializers.CharField(read_only=True)
+
+
+class AgentRunAsIdentitiesQueryParamsSerializer(serializers.Serializer):
     page = serializers.IntegerField(min_value=1, required=False, default=1)
     size = serializers.IntegerField(min_value=1, max_value=100, required=False)
     search = serializers.CharField(required=False, allow_blank=True, default="")
@@ -83,6 +90,10 @@ class AgentToolSerializer(serializers.Serializer):
     name = serializers.CharField()
     group = serializers.CharField()
     changes_data = serializers.BooleanField()
+    deactivated = serializers.BooleanField(
+        help_text="Whether the Agent's workspace can't use the tool, for lack of a "
+        "licence for example. A deactivated tool can't be allowed."
+    )
 
 
 class AgentConfigurationSerializer(serializers.Serializer):
@@ -135,10 +146,22 @@ class AgentConfigurationSerializer(serializers.Serializer):
         help_text="Whether the agent's model can search the web, but not while the "
         "agent uses workspace tools."
     )
+    web_fetch_enabled = serializers.BooleanField(
+        help_text="Whether the agent may open web pages, which Baserow fetches."
+    )
     available_trigger_types = serializers.ListField(
         child=serializers.CharField(),
         help_text="The trigger types that can be added to the agent on this "
         "instance, as service type names.",
+    )
+    available_action_types = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="The service types available as configured agent actions.",
+    )
+    max_actions = serializers.IntegerField(
+        allow_null=True,
+        help_text="How many actions the agent can have on this instance. Null is "
+        "no limit.",
     )
     max_queued_trigger_runs = serializers.IntegerField(
         help_text="How many runs of a trigger that waits or runs in parallel can be "
@@ -160,17 +183,11 @@ class AgentConfigurationSerializer(serializers.Serializer):
         List the registered tools.
 
         :param configuration: The configuration being serialized.
-        :return: Each tool's name, group and whether it changes data.
+        :return: Each tool's name, group, whether it changes data and whether the
+            Agent's workspace can't use it.
         """
 
-        return [
-            {
-                "name": tool_type.type,
-                "group": tool_type.group,
-                "changes_data": tool_type.changes_data,
-            }
-            for tool_type in agent_tool_type_registry.get_all()
-        ]
+        return AgentHandler().get_available_tools(configuration.deactivated_tools)
 
     @extend_schema_field(AgentRunAsSerializer(allow_null=True))
     def get_run_as(self, configuration: AgentConfiguration) -> dict | None:
@@ -243,6 +260,7 @@ class AgentConfigurationUpdateSerializer(
             "run_as_subject_id",
             "allowed_tools",
             "web_search_enabled",
+            "web_fetch_enabled",
             "ask_first_tools",
         )
         extra_kwargs = {
@@ -415,6 +433,7 @@ class AgentMessageStepItemErrorSerializer(serializers.Serializer):
 
 
 class AgentMessageStepSerializer(serializers.Serializer):
+    presentation_type = serializers.CharField(required=False)
     id = serializers.CharField()
     tool = serializers.CharField()
     status = serializers.ChoiceField(choices=list(ChatRunStepStatus))
@@ -432,6 +451,23 @@ class AgentToolApprovalSerializer(serializers.ModelSerializer):
     class Meta:
         model = AgentToolApproval
         fields = ("id", "step_id", "pause", "tool", "status", "reason")
+
+
+class AgentPendingReplySerializer(serializers.ModelSerializer):
+    conversation = AgentConversationSerializer(read_only=True)
+    approvals = AgentToolApprovalSerializer(source="pending_approvals", many=True)
+    steps = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AgentMessage
+        fields = ("uuid", "conversation", "approvals", "steps")
+
+    @extend_schema_field(AgentMessageStepSerializer(many=True))
+    def get_steps(self, reply):
+        pending = {item.step_id for item in reply.pending_approvals}
+        return AgentMessageStepSerializer(
+            [step for step in reply.steps or [] if step["id"] in pending], many=True
+        ).data
 
 
 class AgentMessageSerializer(serializers.ModelSerializer):

@@ -6,6 +6,7 @@ from typing import Any
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.fields import ArrayField
@@ -29,14 +30,17 @@ from django.db.models.functions import Coalesce
 from django.db.models.manager import BaseManager
 from django.utils.crypto import get_random_string
 
+from django_cte import CTEManager
+
 from baserow.core.context import PRIVATE_LINK_TOKEN_PATTERN
-from baserow.core.feature_flags import FF_USER_TEMPLATES, feature_flag_is_enabled
 from baserow.core.jobs.mixins import (
     JobWithUndoRedoIds,
     JobWithUserIpAddress,
     JobWithWebsocketId,
 )
 from baserow.core.jobs.models import Job
+from baserow.core.managers import make_trash_manager
+from baserow.core.user.managers import human_memberships
 from baserow.core.user_files.models import UserFile
 
 from .abuse_reports.models import AbuseReport
@@ -69,7 +73,6 @@ __all__ = [
     "WorkspaceUser",
     "WorkspaceInvitation",
     "WorkspaceInvitationLink",
-    "Agent",
     "Application",
     "TemplateCategory",
     "Template",
@@ -216,11 +219,33 @@ class Settings(models.Model):
     )
 
 
-class UserProfile(models.Model):
+class UserProfile(TrashableModelMixin, models.Model):
     """
     User profile to store user specific information that can't be stored in
     default user model.
     """
+
+    class UserType(models.TextChoices):
+        HUMAN = "human", "Human"
+        IDENTITY = "identity", "Identity"
+
+    user_type = models.CharField(
+        max_length=8,
+        choices=UserType.choices,
+        default=UserType.HUMAN,
+        db_default=UserType.HUMAN,
+    )
+    trashed = models.BooleanField(default=False, db_default=False)
+    last_active = models.DateTimeField(null=True, blank=True, db_default=None)
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["user"],
+                condition=Q(trashed=True),
+                name="core_profile_trashed_idx",
+            )
+        ]
 
     # Keep these in sync with the web-frontend options in
     # web-frontend/modules/core/enums.js
@@ -417,9 +442,7 @@ class Workspace(HierarchicalModelMixin, TrashableModelMixin, CreatedAndUpdatedOn
         template_types = self.get_template_types()
         if Template.Type.OFFICIAL in template_types:
             return True
-        if Template.Type.USER not in template_types or not feature_flag_is_enabled(
-            FF_USER_TEMPLATES
-        ):
+        if Template.Type.USER not in template_types:
             return False
         # Not cached, because the state of a user template changes. The roots of the
         # revisions are selected along when the templates aren't prefetched.
@@ -454,12 +477,12 @@ class Workspace(HierarchicalModelMixin, TrashableModelMixin, CreatedAndUpdatedOn
         :return: The related workspace user instance.
         """
 
-        if include_trash:
-            manager = WorkspaceUser.objects_and_trash
-        else:
-            manager = WorkspaceUser.objects
-
-        return manager.get(user=user, workspace=self)
+        memberships = (
+            WorkspaceUser.objects_and_identities_and_trash
+            if include_trash
+            else WorkspaceUser.objects_and_identities
+        )
+        return memberships.get(user=user, workspace=self)
 
     def __str__(self):
         return f"<Workspace id={self.id}, name={self.name}>"
@@ -475,6 +498,13 @@ class WorkspaceUser(
     OrderableMixin,
     models.Model,
 ):
+    objects = human_memberships(make_trash_manager(False, parent="workspace"))()
+    trash = human_memberships(make_trash_manager(True, parent="workspace"))()
+    objects_and_trash = human_memberships(CTEManager)()
+    # These also return the memberships of identities, which the others leave out.
+    objects_and_identities = make_trash_manager(False, parent="workspace")()
+    objects_and_identities_and_trash = CTEManager()
+
     user = models.ForeignKey(
         User,
         on_delete=models.CASCADE,
@@ -505,34 +535,6 @@ class WorkspaceUser(
     def get_last_order(cls, user):
         queryset = cls.objects.filter(user=user)
         return cls.get_highest_order_of_queryset(queryset) + 1
-
-
-class Agent(
-    HierarchicalModelMixin,
-    TrashableModelMixin,
-    CreatedAndUpdatedOnMixin,
-    models.Model,
-):
-    """A non-authenticating subject owned by a workspace."""
-
-    workspace = models.ForeignKey(
-        Workspace,
-        related_name="agents",
-        on_delete=models.CASCADE,
-    )
-    name = models.CharField(max_length=160)
-    role_uid = models.CharField(
-        max_length=32,
-        default=WORKSPACE_USER_PERMISSION_MEMBER,
-        db_default=WORKSPACE_USER_PERMISSION_MEMBER,
-    )
-    last_active = models.DateTimeField(null=True, blank=True, db_default=None)
-
-    def get_parent(self):
-        return self.workspace
-
-    class Meta:
-        ordering = ("name", "id")
 
 
 class WorkspaceInvitation(
@@ -637,9 +639,36 @@ class WorkspaceInvitationLink(
         blank=True,
         help_text="The id of the object the link gives a role on.",
     )
+    password = models.CharField(
+        # Sized for the salted hash that Django generates, not for the password the
+        # admin types. The request serializer validates the raw password length.
+        max_length=128,
+        blank=True,
+        default="",
+        db_default="",
+        help_text="The hashed password that people must enter before they can see "
+        "or use the link. Empty when the link isn't password protected.",
+    )
 
     def get_parent(self):
         return self.workspace
+
+    @property
+    def has_password(self) -> bool:
+        return self.password != ""  # nosec b105
+
+    def set_password(self, raw_password: str):
+        """
+        Protects the link with the given password, or removes the protection when
+        the password is empty.
+        """
+
+        self.password = make_password(raw_password) if raw_password else ""
+
+    def check_password(self, raw_password: str) -> bool:
+        if not self.has_password:
+            return True
+        return check_password(raw_password, self.password)
 
     class Meta:
         ordering = ("id",)
@@ -748,7 +777,7 @@ def is_instance_admin(actor: Any) -> bool:
     return isinstance(actor, User) and actor.is_active and actor.is_staff
 
 
-def _root_q(**lookups) -> Q:
+def template_root_q(**lookups) -> Q:
     """
     Matches the rows whose root matches the lookups: the root itself, which also
     holds revision 1, and every later revision pointing at it.
@@ -768,7 +797,10 @@ def template_state_expression() -> Case:
     """
 
     return Case(
-        When(_root_q(blocked_at__isnull=False), then=Value(UserTemplateState.BLOCKED)),
+        When(
+            template_root_q(blocked_at__isnull=False),
+            then=Value(UserTemplateState.BLOCKED),
+        ),
         When(
             last_submitted_state=Template.ReviewState.PENDING,
             then=Value(UserTemplateState.IN_REVIEW),
@@ -778,7 +810,7 @@ def template_state_expression() -> Case:
             then=Value(UserTemplateState.REJECTED),
         ),
         When(
-            _root_q(public_revision__isnull=False),
+            template_root_q(public_revision__isnull=False),
             then=Value(UserTemplateState.PUBLIC),
         ),
         default=Value(UserTemplateState.PRIVATE),
@@ -828,7 +860,7 @@ class TemplateQuerySet(QuerySet):
         """
 
         return self.filter(
-            _root_q(public_revision=F("id"), blocked_at__isnull=True)
+            template_root_q(public_revision=F("id"), blocked_at__isnull=True)
         ).select_related("root")
 
     def listed(self):
@@ -848,7 +880,7 @@ class TemplateQuerySet(QuerySet):
         and every later revision pointing at it.
         """
 
-        return self.filter(_root_q(**lookups))
+        return self.filter(template_root_q(**lookups))
 
     def with_template_state(self) -> "TemplateQuerySet":
         """
@@ -954,6 +986,36 @@ class TemplateQuerySet(QuerySet):
 
         return self.with_can_approve().filter(can_approve=True)
 
+    def approvable_without_review(self) -> "TemplateQuerySet":
+        """
+        The pending rows an admin can approve, of templates without an open
+        rejection: what is approved when approval isn't required.
+
+        :return: Those rows, annotated like `with_template_state`.
+        """
+
+        return (
+            self.approvable()
+            .filter(review_state=Template.ReviewState.PENDING)
+            .with_template_state()
+            .filter(has_open_rejection=False)
+        )
+
+    def with_updated_since_blocked(self) -> "TemplateQuerySet":
+        """
+        Annotates the rows with `updated_since_blocked`: whether the revision was
+        made after its template was last blocked. Null when it isn't blocked.
+
+        :return: The rows, annotated.
+        """
+
+        return self.annotate(
+            updated_since_blocked=ExpressionWrapper(
+                Q(created_on__gt=Coalesce("root__blocked_at", "blocked_at")),
+                output_field=models.BooleanField(),
+            )
+        )
+
     def official_owned_or_linked(
         self, actor: Any, private_link_token: str | None = None
     ):
@@ -968,9 +1030,9 @@ class TemplateQuerySet(QuerySet):
 
         q = _official_template_q()
         if (user_id := _get_user_id(actor)) is not None:
-            q |= Q(type=Template.Type.USER) & _root_q(owner_id=user_id)
+            q |= Q(type=Template.Type.USER) & template_root_q(owner_id=user_id)
         if private_link_token is not None:
-            q |= Q(type=Template.Type.USER) & _root_q(
+            q |= Q(type=Template.Type.USER) & template_root_q(
                 private_link_token=private_link_token
             )
         return self.filter(q)
@@ -999,27 +1061,26 @@ class TemplateQuerySet(QuerySet):
         """
 
         official = _official_template_q()
-        if not feature_flag_is_enabled(FF_USER_TEMPLATES):
-            return self.filter(official)
-
-        visible = _root_q(
+        visible = template_root_q(
             public_revision=F("id"),
             blocked_at__isnull=True,
             marked_for_deletion_at__isnull=True,
         )
         if (user_id := _get_user_id(actor)) is not None:
-            visible |= _root_q(owner_id=user_id, marked_for_deletion_at__isnull=True)
+            visible |= template_root_q(
+                owner_id=user_id, marked_for_deletion_at__isnull=True
+            )
         queryset = self
         if private_link_token is not None:
             queryset = queryset.alias(family_id=Coalesce("root_id", "id"))
-            visible |= _root_q(
+            visible |= template_root_q(
                 private_link_token=private_link_token,
                 public_revision__isnull=True,
                 blocked_at__isnull=True,
                 marked_for_deletion_at__isnull=True,
             ) & ~Q(Exists(_later_revisions()))
         if allow_instance_admin and is_instance_admin(actor):
-            visible |= _root_q(marked_for_deletion_at__isnull=True)
+            visible |= template_root_q(marked_for_deletion_at__isnull=True)
         return queryset.filter(official | Q(type=Template.Type.USER) & visible)
 
 
@@ -1358,9 +1419,7 @@ class Template(models.Model):
         if self.type in (None, Template.Type.OFFICIAL):
             return True
         root = self.get_root()
-        if root.marked_for_deletion_at is not None or not feature_flag_is_enabled(
-            FF_USER_TEMPLATES
-        ):
+        if root.marked_for_deletion_at is not None:
             return False
         if root.public_revision_id == self.id and root.blocked_at is None:
             return True

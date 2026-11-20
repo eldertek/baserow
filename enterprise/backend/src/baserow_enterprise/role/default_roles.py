@@ -233,11 +233,12 @@ from baserow.contrib.database.webhooks.operations import (
 from baserow.contrib.database.workflow_actions.operations import (
     DispatchDatabaseWorkflowActionOperationType,
 )
-from baserow.core.agents.operations import (
-    CreateAgentOperationType,
-    DeleteAgentOperationType,
-    ListAgentsWorkspaceOperationType,
-    UpdateAgentOperationType,
+from baserow.core.identities.operations import (
+    BindIdentityOperationType,
+    CreateIdentityOperationType,
+    DeleteIdentityOperationType,
+    ListIdentitiesWorkspaceOperationType,
+    UpdateIdentityOperationType,
 )
 from baserow.core.integrations.operations import (
     CreateIntegrationOperationType,
@@ -500,7 +501,8 @@ default_roles[BUILDER_ROLE_UID].extend(
     default_roles[EDITOR_ROLE_UID]
     + [
         ReadAgentConfigurationOperationType,
-        ListAgentsWorkspaceOperationType,
+        ListIdentitiesWorkspaceOperationType,
+        BindIdentityOperationType,
         CreatePageOperationType,
         DeletePageOperationType,
         UpdatePageOperationType,
@@ -654,9 +656,9 @@ default_roles[BUILDER_ROLE_UID].extend(
 default_roles[ADMIN_ROLE_UID].extend(
     default_roles[BUILDER_ROLE_UID]
     + [
-        CreateAgentOperationType,
-        UpdateAgentOperationType,
-        DeleteAgentOperationType,
+        CreateIdentityOperationType,
+        UpdateIdentityOperationType,
+        DeleteIdentityOperationType,
         UpdateWorkspaceOperationType,
         DeleteWorkspaceOperationType,
         DeleteDatabaseRowOperationType,

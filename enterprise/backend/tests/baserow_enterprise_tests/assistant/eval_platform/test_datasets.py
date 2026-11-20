@@ -376,6 +376,7 @@ EXPECTED_CASE_IDS = {
         "database/creates-view-kanban",
         "database/creates-view-timeline",
         "database/deletes-field",
+        "database/finds-comments-mentioning-me",
         "database/reads-row-comments",
         "database/renames-field",
         "database/sorts-view",
@@ -490,6 +491,7 @@ EXPECTED_CASE_IDS = {
     ],
     "kuma-automation": [
         "automation/adds-slack-to-router-branch",
+        "automation/adds-update-of-created-row",
         "automation/changes-router-condition",
         "automation/creates-email-notification-workflow",
         "automation/creates-router-workflow",
@@ -500,6 +502,7 @@ EXPECTED_CASE_IDS = {
         "automation/deletes-node",
         "automation/edits-email-subject",
         "automation/lists-workflows",
+        "automation/updates-created-row",
     ],
     "kuma-prod-replay": [
         "prod-replay/fake-rows-into-typed-fields",
@@ -546,10 +549,10 @@ class TestDatasetCounts:
         grouped = cases_by_dataset()
 
         assert len(grouped["kuma-core"]) == 11
-        assert len(grouped["kuma-database"]) == 25
+        assert len(grouped["kuma-database"]) == 26
         assert len(grouped["kuma-docs"]) == 64
         assert len(grouped["kuma-builder"]) == 39
-        assert len(grouped["kuma-automation"]) == 11
+        assert len(grouped["kuma-automation"]) == 13
         assert len(grouped["kuma-prod-replay"]) == 9
 
     def test_case_ids_match_inventory(self):

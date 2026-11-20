@@ -64,9 +64,21 @@ export class ToolPresentationType extends Registerable {
     return ''
   }
 
+  /**
+   * @returns {Array|null} The modal, and its props, that says why a tool the
+   *   workspace can't use is locked, or null without one.
+   */
+  getDeactivatedClickModal() {
+    return null
+  }
+
   /** Receives explicitly approved display input and facts, never raw results. */
   getActivity(step, t) {
     return t(`toolPresentation.${step.status}`)
+  }
+
+  getActivityDetails(step, t) {
+    return {}
   }
 
   /** Opt in to the backend's curated input preview; hidden by default. */
@@ -176,7 +188,10 @@ export function toolActivity(step, registry, t) {
     partial: status === STEP_STATUS.DONE && failedItems.length > 0,
   }
   try {
-    const presenter = findPresenter(registry, data.tool)
+    const presenter = findPresenter(
+      registry,
+      data.presentation_type || data.tool
+    )
     if (!presenter) return fallback
     const translate = (key, values, count) => {
       const text = t(key, values, count)
@@ -201,6 +216,7 @@ export function toolActivity(step, registry, t) {
     return {
       ...fallback,
       title,
+      ...presenter.getActivityDetails(normalized, translate),
       group: !data.changes_data ? presenter.group : null,
       input: toolInput(presenter, normalized, translate),
     }

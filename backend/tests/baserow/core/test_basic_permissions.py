@@ -26,7 +26,7 @@ from baserow.core.integrations.operations import (
     ListIntegrationsApplicationOperationType,
     UpdateIntegrationOperationType,
 )
-from baserow.core.models import Agent, Template, Workspace
+from baserow.core.models import Template, User, Workspace
 from baserow.core.operations import (
     CreateApplicationsWorkspaceOperationType,
     ListApplicationsWorkspaceOperationType,
@@ -60,7 +60,7 @@ from baserow.core.user_sources.operations import (
 )
 
 
-@pytest.mark.parametrize("actor", [None, AnonymousUser(), Agent(id=1)])
+@pytest.mark.parametrize("actor", [None, AnonymousUser(), User(id=1)])
 def test_permission_check_preserves_actor_and_anonymous_fallback(actor):
     check = PermissionCheck(actor, ReadWorkspaceOperationType.type)
     assert check.actor is (AnonymousUser if actor is None else actor)
@@ -273,6 +273,34 @@ def test_workspace_member_permission_manager(data_fixture, django_assert_num_que
     assert len(filtered[0]) == 0
 
 
+def _batched_check_query_count(data_fixture, actor_count: int) -> int:
+    members = [data_fixture.create_user() for _ in range(actor_count)]
+    workspace = data_fixture.create_workspace(members=members)
+    identities = [
+        data_fixture.create_identity(workspace=workspace, role_uid="MEMBER")
+        for _ in range(actor_count)
+    ]
+    actors = list(
+        User.objects_and_identities.filter(
+            id__in=[actor.id for actor in members + identities]
+        )
+    )
+    with local_cache.context(), CaptureQueriesContext(connection) as queries:
+        allowed = CoreHandler().check_permission_for_multiple_actors(
+            actors, ListApplicationsWorkspaceOperationType.type, workspace, workspace
+        )
+    assert len(allowed) == len(actors)
+    return len(queries)
+
+
+@pytest.mark.django_db
+def test_batched_permission_check_queries_do_not_grow_with_actors(data_fixture):
+    few = _batched_check_query_count(data_fixture, 2)
+    many = _batched_check_query_count(data_fixture, 20)
+
+    assert many <= few
+
+
 @pytest.mark.django_db
 def test_basic_permission_manager_batches_workspace_roles_by_subject_type(
     data_fixture, mocker
@@ -282,19 +310,18 @@ def test_basic_permission_manager_batches_workspace_roles_by_subject_type(
     workspace = data_fixture.create_workspace(
         user=admin, custom_permissions=[(member, "MEMBER")]
     )
-    admin_agent = Agent.objects.create(
-        workspace=workspace, name="Admin agent", role_uid="ADMIN"
+    admin_identity = data_fixture.create_identity(
+        workspace=workspace, name="Admin identity", role_uid="ADMIN"
     )
-    member_agent = Agent.objects.create(
-        workspace=workspace, name="Member agent", role_uid="MEMBER"
+    member_identity = data_fixture.create_identity(
+        workspace=workspace, name="Member identity", role_uid="MEMBER"
     )
     user_subject_type = subject_type_registry.get_by_model(admin)
-    agent_subject_type = subject_type_registry.get_by_model(admin_agent)
+    identity_subject_type = subject_type_registry.get_by_model(admin_identity)
     get_user_roles = mocker.spy(user_subject_type, "get_workspace_role_uids")
-    get_agent_roles = mocker.spy(agent_subject_type, "get_workspace_role_uids")
     checks = [
         PermissionCheck(actor, UpdateWorkspaceOperationType.type, workspace)
-        for actor in [admin, member, admin_agent, member_agent]
+        for actor in [admin, member, admin_identity, member_identity]
     ]
 
     result = BasicPermissionManagerType().check_multiple_permissions(checks, workspace)
@@ -304,9 +331,12 @@ def test_basic_permission_manager_batches_workspace_roles_by_subject_type(
     assert result[checks[2]] is True
     assert isinstance(result[checks[3]], UserInvalidWorkspacePermissionsError)
     get_user_roles.assert_called_once()
-    assert set(get_user_roles.call_args.args[0]) == {admin, member}
-    get_agent_roles.assert_called_once()
-    assert set(get_agent_roles.call_args.args[0]) == {admin_agent, member_agent}
+    assert set(get_user_roles.call_args.args[0]) == {
+        admin,
+        member,
+        admin_identity,
+        member_identity,
+    }
 
 
 @pytest.mark.django_db
@@ -314,43 +344,45 @@ def test_basic_permission_manager_batches_workspace_roles_by_subject_type(
     ("role_uid", "is_admin"),
     [("ADMIN", True), ("MEMBER", False), ("NO_ACCESS", False)],
 )
-def test_basic_permission_manager_get_permissions_object_for_agent(
+def test_basic_permission_manager_get_permissions_object_for_identity(
     data_fixture, role_uid, is_admin
 ):
     workspace = data_fixture.create_workspace()
-    agent = Agent.objects.create(
-        workspace=workspace, name=f"{role_uid} agent", role_uid=role_uid
+    identity = data_fixture.create_identity(
+        workspace=workspace, name=f"{role_uid} identity", role_uid=role_uid
     )
 
-    permissions = BasicPermissionManagerType().get_permissions_object(agent, workspace)
+    permissions = BasicPermissionManagerType().get_permissions_object(
+        identity, workspace
+    )
 
     assert permissions["is_admin"] is is_admin
 
 
 @pytest.mark.django_db
-def test_basic_permission_manager_rejects_agent_from_another_workspace(data_fixture):
+def test_basic_permission_manager_rejects_identity_from_another_workspace(data_fixture):
     workspace = data_fixture.create_workspace()
-    agent = Agent.objects.create(
+    identity = data_fixture.create_identity(
         workspace=data_fixture.create_workspace(),
         name="Other admin",
         role_uid="ADMIN",
     )
-    check = PermissionCheck(agent, UpdateWorkspaceOperationType.type, workspace)
+    check = PermissionCheck(identity, UpdateWorkspaceOperationType.type, workspace)
     permission_manager = BasicPermissionManagerType()
 
     result = permission_manager.check_multiple_permissions([check], workspace)
 
     assert isinstance(result[check], UserInvalidWorkspacePermissionsError)
-    assert permission_manager.get_permissions_object(agent, workspace) is None
+    assert permission_manager.get_permissions_object(identity, workspace) is None
 
 
 @pytest.mark.django_db
-def test_basic_permission_manager_can_include_trashed_agent(data_fixture):
+def test_basic_permission_manager_can_include_trashed_identity(data_fixture):
     workspace = data_fixture.create_workspace()
-    agent = Agent.objects.create(
+    identity = data_fixture.create_identity(
         workspace=workspace, name="Trashed admin", role_uid="ADMIN", trashed=True
     )
-    check = PermissionCheck(agent, UpdateWorkspaceOperationType.type, workspace)
+    check = PermissionCheck(identity, UpdateWorkspaceOperationType.type, workspace)
     permission_manager = BasicPermissionManagerType()
 
     without_trash = permission_manager.check_multiple_permissions([check], workspace)
@@ -360,9 +392,9 @@ def test_basic_permission_manager_can_include_trashed_agent(data_fixture):
 
     assert isinstance(without_trash[check], UserInvalidWorkspacePermissionsError)
     assert with_trash[check] is True
-    assert permission_manager.get_permissions_object(agent, workspace) is None
+    assert permission_manager.get_permissions_object(identity, workspace) is None
     assert permission_manager.get_permissions_object(
-        agent, workspace, include_trash=True
+        identity, workspace, include_trash=True
     )["is_admin"]
 
 
@@ -719,9 +751,9 @@ def test_get_permissions(data_fixture):
                     "workspace.empty_trash",
                     "workspace_user.update",
                     "workspace_user.delete",
-                    "agent.create",
-                    "agent.update",
-                    "agent.delete",
+                    "identity.create",
+                    "identity.update",
+                    "identity.delete",
                 ],
                 "is_admin": True,
             },
@@ -869,9 +901,9 @@ def test_get_permissions(data_fixture):
                     "workspace.empty_trash",
                     "workspace_user.update",
                     "workspace_user.delete",
-                    "agent.create",
-                    "agent.update",
-                    "agent.delete",
+                    "identity.create",
+                    "identity.update",
+                    "identity.delete",
                 ],
                 "is_admin": True,
             },
@@ -1019,9 +1051,9 @@ def test_get_permissions(data_fixture):
                     "workspace.empty_trash",
                     "workspace_user.update",
                     "workspace_user.delete",
-                    "agent.create",
-                    "agent.update",
-                    "agent.delete",
+                    "identity.create",
+                    "identity.update",
+                    "identity.delete",
                 ],
                 "is_admin": False,
             },
@@ -1358,7 +1390,7 @@ def test_allow_if_template_permission_manager_query_count(data_fixture):
 
     # Model instances retain membership results. Use a fresh actor so both
     # measurements start with the same cache state, as separate requests would.
-    buser = type(buser).objects.get(pk=buser.pk)
+    buser = type(buser).objects.select_related("profile").get(pk=buser.pk)
     with (
         CaptureQueriesContext(connection) as query_not_for_template,
         local_cache.context(),
@@ -1592,14 +1624,13 @@ def test_allow_if_template_permission_manager_allows_openable_templates(
         for row in templates:
             template, workspace = row[0], row[0].workspace
             token = get_link_token(template) if has_link else None
-            enabled = user_templates_enabled or template.type != Template.Type.USER
-            allowed = row[column] and enabled
+            allowed = row[column]
             listed_column = OTHERS if column == HOLDER else column
-            listed = row[listed_column] and enabled
+            listed = row[listed_column]
             in_lists = column != ADMIN or row[OTHERS]
             as_admin = OWNER if column == ADMIN else None
-            checked = row[as_admin or column] and enabled
-            checked_listed = row[as_admin or listed_column] and enabled
+            checked = row[as_admin or column]
+            checked_listed = row[as_admin or listed_column]
             opener = PermissionCheck(actor, ReadWorkspaceOperationType.type).actor
             reason = (template.name, actor, has_link)
             assert (
@@ -1691,8 +1722,7 @@ def test_allow_if_template_permissions_object_lists_official_and_own_templates(
             for row in templates
             if row[0].type != Template.Type.USER
             or (
-                user_templates_enabled
-                and row[column]
+                row[column]
                 and (
                     column == OWNER
                     or column == HOLDER

@@ -51,6 +51,7 @@
         </a>
       </div>
       <WorkspaceRoleSelector
+        v-if="roles.length > 0"
         v-model="roleUid"
         class="invite-input__role"
         :workspace="workspace"
@@ -59,23 +60,19 @@
       <Button
         type="primary"
         :disabled="
-          validSelected.length === 0 ||
+          submittable.length === 0 ||
           hasInvalidEmails ||
           batchLimitExceeded ||
           disabled
         "
         @click="submit"
       >
-        <slot
-          name="submit-label"
-          :count="validSelected.length"
-          :role="roleName"
-        >
+        <slot name="submit-label" :count="submittable.length" :role="roleName">
           {{
-            validSelected.length === 0
+            submittable.length === 0
               ? $t('inviteInput.invite')
               : $t('inviteInput.inviteAs', {
-                  count: validSelected.length,
+                  count: submittable.length,
                   role: roleName,
                 })
           }}
@@ -210,9 +207,11 @@ export function extractEmails(text) {
 /**
  * The input of the invite modal: one field that takes email addresses, typed
  * or pasted in bulk, and searches a list of `options`, grouped by `tabs`, such
- * as the members, teams and agents of the workspace. Every pick is shown as a
+ * as the members, teams and identities of the workspace. Every pick is shown as a
  * chip. Submitting emits `add` with the picked items and the chosen role uid;
- * the parent calls `remove()` or `reset()` once they were added.
+ * the parent calls `remove()` or `reset()` once they were added. An address
+ * that is still in the field when submitting is picked first, so it is
+ * submitted with the chips.
  *
  * An option is an object of `{ key, type, id, name, subtitle, search,
  * avatarComponent, subject }` with an optional `email` for someone who can be
@@ -227,7 +226,10 @@ export function extractEmails(text) {
  * but makes no sense as an invitation. Malformed email addresses are also
  * marked as errors, but block the whole batch until corrected or removed.
  * The parent decides what is disabled and
- * why, so the input needs to know nothing about members, agents or invitations.
+ * why, so the input needs to know nothing about members, identities or invitations.
+ *
+ * Without `roles` there is no role to choose, for picks that don't come with
+ * one, like the members of a team, and `add` is emitted with a null role uid.
  *
  * `tabs` are `{ value, label }` matching the option types, and an "All" tab is
  * added in front. With tabs the list opens on focus and shows every option,
@@ -425,6 +427,26 @@ export default {
       return this.selected.filter((item) => this.chipError(item) === null)
     },
     /**
+     * The picks for the addresses still in the text field that aren't a chip
+     * yet, which is what pressing enter would add.
+     */
+    typedPicks() {
+      return this.queryEmails
+        .map((email) => this.optionWithEmail(email) || this.emailPick(email))
+        .filter((pick) => !this.isSelected(pick))
+    },
+    /**
+     * What submitting adds: the chips that carry no error and the addresses
+     * still in the text field, so that an address isn't lost for not having
+     * been turned into a chip first.
+     */
+    submittable() {
+      return [
+        ...this.validSelected,
+        ...this.typedPicks.filter((pick) => this.chipError(pick) === null),
+      ]
+    },
+    /**
      * A malformed address blocks the whole batch, including an address still
      * in the text field, so successful invitations can't clear it unseen.
      */
@@ -611,6 +633,10 @@ export default {
      * submission until removed and corrected.
      */
     pickEmails(text) {
+      this.addEmailPicks(text)
+      this.focus()
+    },
+    addEmailPicks(text) {
       for (const token of extractEmails(text)) {
         const email = token.toLowerCase()
         const pick = this.optionWithEmail(email) || this.emailPick(email)
@@ -619,7 +645,6 @@ export default {
         }
       }
       this.query = ''
-      this.focus()
     },
     /**
      * Pasted addresses become chips right away. Text without an address is
@@ -636,12 +661,18 @@ export default {
     },
     submit() {
       if (
-        this.validSelected.length === 0 ||
+        this.submittable.length === 0 ||
         this.hasInvalidEmails ||
         this.batchLimitExceeded ||
         this.disabled
       ) {
         return
+      }
+      // The addresses still in the text field become chips first, as they do
+      // on enter. Otherwise they would be left out of what is submitted and
+      // cleared along with the chips once the parent resets the input.
+      if (this.queryEmails.length > 0) {
+        this.addEmailPicks(this.query)
       }
       this.$emit('add', [...this.validSelected], this.roleUid)
     },

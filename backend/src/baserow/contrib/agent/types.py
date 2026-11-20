@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import NotRequired, TypedDict
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 from uuid import UUID
 
 from django.db.models import F, Value
@@ -14,6 +14,9 @@ from baserow.core.types import Subject
 
 from .constants import AgentConfigurationErrorCode, AgentReadinessState, AgentRunAsState
 from .models import AgentApplication, AgentConversation, AgentMessage, AgentTrigger
+
+if TYPE_CHECKING:
+    from .action_tools.tools import BoundActionTool
 
 
 @dataclass(frozen=True)
@@ -47,8 +50,12 @@ class AgentConfiguration:
     web_search_enabled: bool
     web_search_available: bool
     web_search_blocked_by_tools: bool
+    web_fetch_enabled: bool
     ask_first_tools: list[str]
+    deactivated_tools: list[str]
     available_trigger_types: list[str]
+    available_action_types: list[str]
+    max_actions: int | None
     max_queued_trigger_runs: int
     max_parallel_trigger_runs: int
     errors: dict[str, AgentConfigurationErrorCode]
@@ -105,10 +112,20 @@ class AgentConversationCursor(KeysetCursor):
 
 @dataclass
 class AgentTriggerUpdated:
-    """An updated trigger and the parts of it that the update changed."""
+    """An updated trigger, its changed parts and its previous type when replaced."""
 
     trigger: AgentTrigger
     changed_fields: list[str]
+    previous_type: str | None = None
+
+
+@dataclass(frozen=True)
+class AgentTriggerTypeOptions:
+    """A trigger type an agent may use, as the agent's run identity sees it."""
+
+    type: str
+    form_choices: dict | None
+    default_on_overlap: AgentTrigger.OnOverlap
 
 
 @dataclass(frozen=True)
@@ -143,6 +160,14 @@ class AgentReplyResume:
 
 
 @dataclass(frozen=True)
+class AgentConversationUser:
+    """The person a private conversation is with."""
+
+    id: int
+    name: str
+
+
+@dataclass(frozen=True)
 class AgentReplyRequest:
     reply_id: int
     workspace: Workspace | None
@@ -161,10 +186,16 @@ class AgentReplyRequest:
     """Who the tools act as, or None for no workspace access."""
     allowed_tool_names: list[str] = field(default_factory=list)
     """The tools the reply may call, none without an identity to act as."""
+    unavailable_tool_messages: list[str] = field(default_factory=list)
+    """Instructions naming the allowed tools the workspace can't use, and why."""
     ask_first_tool_names: list[str] = field(default_factory=list)
     """The allowed tools whose calls wait for the owner's approval."""
+    action_tools: list["BoundActionTool"] = field(default_factory=list)
+    """The enabled actions, which don't act as the Agent's identity."""
     timezone: str | None = None
     """The timezone of the owner, for the dates the tools read and write."""
+    conversation_user: AgentConversationUser | None = None
+    """The person the conversation is with, or None when a trigger started it."""
     mcp_servers: tuple[MCPServerSnapshot, ...] = ()
     """The MCP servers with tools turned on, as reviewed when the reply started."""
     reasoning_effort: str | None = None
@@ -173,6 +204,10 @@ class AgentReplyRequest:
     """The provider's web search, when it's turned on and the model has one."""
     web_search_enabled: bool = False
     """Whether web search is turned on, even when the model can't use it."""
+    started_by_trigger: bool = False
+    """Whether a trigger started the conversation, so its prompt is outside data."""
+    web_fetch_enabled: bool = False
+    """Whether the reply may open web pages, which Baserow fetches for any model."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +218,8 @@ class AgentPausedRun:
     """The run, dumped with its messages and held calls."""
     web_search: bool
     """Whether it offered web search."""
+    web_fetch: bool
+    """Whether it offered opening web pages."""
     run_as: Subject | None
     """Who its tools acted as, or None for no workspace access."""
 
@@ -201,7 +238,7 @@ class AgentReplyResult:
     waiting_calls: list[ChatRunWaitingCall] = field(default_factory=list)
     """The calls held for the owner's approval, when the run paused."""
     tool_keys: dict[str, str] = field(default_factory=dict)
-    """The approval key of each held MCP call's tool, by tool name."""
+    """The approval key of each held MCP or action call's tool, by tool name."""
     paused_run: AgentPausedRun | None = None
     """The paused run, to resume once its held calls are decided."""
 

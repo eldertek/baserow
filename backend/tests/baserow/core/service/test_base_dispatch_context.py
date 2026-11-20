@@ -13,6 +13,13 @@ def test_the_default_range_is_the_first_page_at_the_default_size():
     assert MinimalDispatchContext().range(None) == (0, None)
 
 
+def test_resolved_values_survive_a_clone():
+    dispatch_context = MinimalDispatchContext(resolved_values={1: {"body": "shown"}})
+
+    assert dispatch_context.clone().resolved_values == {1: {"body": "shown"}}
+    assert MinimalDispatchContext().resolved_values is None
+
+
 def test_nothing_is_public_by_default():
     dispatch_context = MinimalDispatchContext()
 
@@ -22,6 +29,7 @@ def test_nothing_is_public_by_default():
     assert dispatch_context.search_query() is None
     assert dispatch_context.searchable_fields() == []
     assert dispatch_context.filters() is None
+    assert dispatch_context.get_runtime_filters(None) == []
     assert dispatch_context.sortings() is None
     assert dispatch_context.public_allowed_properties is None
 

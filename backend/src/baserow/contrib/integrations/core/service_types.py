@@ -82,6 +82,7 @@ from baserow.contrib.integrations.core.models import (
     HTTPFormData,
     HTTPHeader,
     HTTPQueryParam,
+    SMTPIntegration,
     generate_inbound_email_token,
 )
 from baserow.contrib.integrations.core.utils import (
@@ -120,6 +121,7 @@ from baserow.core.services.dispatch_context import DispatchContext
 from baserow.core.services.exceptions import (
     AddressNotAllowedDispatchException,
     InvalidContextContentDispatchException,
+    RedirectNotAllowedDispatchException,
     RemoteBusyDispatchException,
     RemoteRefusedDispatchException,
     RuntimeDispatchException,
@@ -530,6 +532,13 @@ class CoreHTTPRequestServiceType(CoreServiceType):
             .prefetch_related("headers", "query_params", "form_data")
         )
 
+    def get_configuration_errors(
+        self, service: CoreHTTPRequestService
+    ) -> dict[str, str]:
+        if not (service.url or {}).get("formula", "").strip():
+            return {"url": "required"}
+        return {}
+
     def max_dispatch_seconds(self, service: CoreHTTPRequestService) -> int:
         # For a click, whose request gets one timeout in all. The watchdog
         # hangs up at the deadline; should the hang-up land late, a read
@@ -671,24 +680,32 @@ class CoreHTTPRequestServiceType(CoreServiceType):
         self, service: CoreHTTPRequestService
     ) -> list[FormulaToResolve]:
         formulas = [
-            FormulaToResolve(
-                "body_content",
-                service.body_content,
-                ensure_string,
-                'property "body_content"',
-            ),
             FormulaToResolve("url", service.url, ensure_string, 'property "URL"'),
         ]
 
-        for fdata in service.form_data.all():
-            formulas.append(
+        # Only what the body type sends is resolved: a body left from another
+        # type must neither fail the request nor be checked.
+        if service.body_type in (BODY_TYPE.JSON, BODY_TYPE.RAW):
+            formulas.insert(
+                0,
                 FormulaToResolve(
-                    f"form_data_{fdata.id}",
-                    fdata.value,
+                    "body_content",
+                    service.body_content,
                     ensure_string,
-                    f'form data "{fdata.key}"',
+                    'property "body_content"',
                 ),
             )
+
+        if service.body_type == BODY_TYPE.FORM:
+            for fdata in service.form_data.all():
+                formulas.append(
+                    FormulaToResolve(
+                        f"form_data_{fdata.id}",
+                        fdata.value,
+                        ensure_string,
+                        f'form data "{fdata.key}"',
+                    ),
+                )
 
         for header in service.headers.all():
             formulas.append(
@@ -768,11 +785,16 @@ class CoreHTTPRequestServiceType(CoreServiceType):
                 params=query_params,
                 deadline=deadline,
                 operation_timeout=service.timeout,
+                redirects_stay_on_host=dispatch_context.redirects_stay_on_host,
                 **body_kwargs,
             )
-        except ServiceImproperlyConfiguredDispatchException:
-            # Too big. The message names no address, so it travels as it is
-            # rather than as an unknown error.
+        except (
+            ServiceImproperlyConfiguredDispatchException,
+            RedirectNotAllowedDispatchException,
+        ):
+            # Too big, or redirected where the caller doesn't follow. The
+            # message names no address, so it travels as it is rather than as
+            # an unknown error.
             raise
         except UnacceptableAddressException as e:
             # Refused before anything was sent, so a caller counting outbound
@@ -813,7 +835,7 @@ class CoreHTTPRequestServiceType(CoreServiceType):
         Sends the request to the endpoint using the given data.
         """
 
-        body_content = resolved_values["body_content"]
+        body_content = resolved_values.get("body_content", "")
         body_dict = {}
 
         if service.body_type == BODY_TYPE.JSON:  # JSON payload
@@ -858,6 +880,8 @@ class CoreHTTPRequestServiceType(CoreServiceType):
                     "body_omitted": False,
                     "headers": {},
                     "status_code": 504,
+                    # Not an answer of the server: this side stopped waiting.
+                    "timed_out": True,
                 }
             }
 
@@ -1676,6 +1700,26 @@ class CoreSMTPEmailServiceType(CoreServiceType):
 
     def requires_integration(self, service: CoreSMTPEmailService) -> bool:
         return not self._should_use_instance_smtp(service)
+
+    def get_configuration_errors(self, service: CoreSMTPEmailService) -> dict[str, str]:
+        errors = {}
+        required = ["to_emails"]
+        if service.use_instance_smtp_settings:
+            if self.instance_smtp_unavailable_reason():
+                errors["use_instance_smtp_settings"] = "unavailable"
+        else:
+            required.append("from_email")
+            if service.integration_id and service.integration is not None:
+                integration = service.integration.specific
+                if isinstance(integration, SMTPIntegration):
+                    if not integration.host or not 1 <= integration.port <= 65535:
+                        errors["integration_id"] = "invalid"
+                    if integration.use_tls and integration.use_ssl:
+                        errors["integration_id"] = "invalid"
+        for field in required:
+            if not getattr(service, field)["formula"].strip():
+                errors[field] = "required"
+        return errors
 
     def prepare_values(self, values, user: AbstractUser, instance=None):
         values = super().prepare_values(values, user, instance)
@@ -3239,6 +3283,8 @@ class CoreHTTPTriggerServiceType(TriggerServiceTypeMixin, ServiceType):
         "wait_for_response",
         "response_timeout_seconds",
     ]
+    # Anyone who knows the uid can call the webhook of the exported trigger.
+    sensitive_fields = ["uid"]
 
     class SerializedDict(ServiceDict):
         uid: str

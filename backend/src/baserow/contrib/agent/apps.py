@@ -16,6 +16,21 @@ class AgentConfig(AppConfig):
         from baserow.core.services.registries import service_type_registry
         from baserow.core.trash.registries import trash_item_type_registry
 
+        from .action_tools.action_types import (
+            HTTPRequestAgentActionType,
+            SMTPEmailAgentActionType,
+        )
+        from .action_tools.actions import (
+            CreateAgentActionActionType,
+            DeleteAgentActionActionType,
+            UpdateAgentActionActionType,
+        )
+        from .action_tools.data_providers import (
+            ToolInputDataProviderType,
+            agent_action_data_provider_type_registry,
+        )
+        from .action_tools.registries import agent_action_type_registry
+        from .action_tools.trash_types import AgentActionTrashableItemType
         from .actions import (
             CreateAgentConversationActionType,
             CreateAgentMessageActionType,
@@ -67,7 +82,13 @@ class AgentConfig(AppConfig):
         )
         from .triggers.data_providers import TriggerDataProviderType
         from .triggers.dispatcher import agent_trigger_dispatcher
+        from .triggers.registries import agent_trigger_type_registry
         from .triggers.trash_types import AgentTriggerTrashableItemType
+        from .triggers.trigger_types import (
+            ROWS_TRIGGER_TYPES,
+            HTTPAgentTriggerType,
+            RowsAgentTriggerType,
+        )
 
         application_type_registry.register(AgentApplicationType())
         workspace_search_registry.register(AgentSearchType())
@@ -92,10 +113,20 @@ class AgentConfig(AppConfig):
             CreateAgentTriggerActionType,
             UpdateAgentTriggerActionType,
             DeleteAgentTriggerActionType,
+            CreateAgentActionActionType,
+            UpdateAgentActionActionType,
+            DeleteAgentActionActionType,
         ):
             action_type_registry.register(action())
         trash_item_type_registry.register(AgentConversationTrashableItemType())
         trash_item_type_registry.register(AgentTriggerTrashableItemType())
+        trash_item_type_registry.register(AgentActionTrashableItemType())
+        agent_action_type_registry.register(SMTPEmailAgentActionType())
+        agent_action_type_registry.register(HTTPRequestAgentActionType())
+        agent_trigger_type_registry.register(HTTPAgentTriggerType())
+        for type_name in ROWS_TRIGGER_TYPES:
+            agent_trigger_type_registry.register(RowsAgentTriggerType(type_name))
+        agent_action_data_provider_type_registry.register(ToolInputDataProviderType())
         chat_run_type_registry.register(AgentChatRunType())
         agent_data_provider_type_registry.register(TriggerDataProviderType())
         for tool_type in (
@@ -119,6 +150,7 @@ class AgentConfig(AppConfig):
             agent_tool_type_registry.register(tool_type())
         service_type_registry.add_trigger_listener(agent_trigger_dispatcher.on_event)
 
+        import baserow.contrib.agent.action_tools.receivers  # noqa: F401
         import baserow.contrib.agent.receivers  # noqa: F401
         import baserow.contrib.agent.triggers.receivers  # noqa: F401
         import baserow.contrib.agent.ws.signals  # noqa: F401

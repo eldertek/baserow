@@ -425,7 +425,8 @@
     "domainNameLabel": "Domain name"
   },
   "subDomainForm": {
-    "domainNameLabel": "Domain name"
+    "domainNameLabel": "Domain name",
+    "noDotError": "The subdomain can't contain a dot"
   },
   "subDomainDetails": {
     "text": "The DNS settings of the domain have already been configured and checked. It works without making any additional changes."
@@ -548,7 +549,9 @@
     "loginToastMessage": "You have been successfully signed in.",
     "loginErrorToastTitle": "Authentication Failed",
     "authorizedToastTitle": "Authentication Required",
-    "authorizedToastMessage": "You must be signed in to access this page. Please log in to continue."
+    "authorizedToastMessage": "You must be signed in to access this page. Please log in to continue.",
+    "siteUpdatedToastTitle": "Site updated",
+    "siteUpdatedToastMessage": "This site was updated while you were using it, so the page was reloaded. Please try again."
   },
   "integrationSettings": {
     "title": "Integrations",
@@ -773,6 +776,7 @@
   },
   "eventTypes": {
     "clickLabel": "On click",
+    "changeLabel": "On change",
     "submitLabel": "On submit",
     "afterLoginLabel": "After login"
   },

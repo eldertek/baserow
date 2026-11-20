@@ -19,12 +19,11 @@ from baserow.api.decorators import (
     validate_body,
     validate_query_parameters,
 )
-from baserow.api.errors import ERROR_USER_NOT_IN_GROUP
+from baserow.api.errors import ERROR_GROUP_DOES_NOT_EXIST, ERROR_USER_NOT_IN_GROUP
 from baserow.api.mixins import RealtimeRecoveryPrimaryReadMixin
 from baserow.api.pagination import PageNumberPagination, encode_keyset_cursor
 from baserow.api.schemas import CLIENT_SESSION_ID_SCHEMA_PARAMETER, get_error_schema
 from baserow.api.serializers import get_example_pagination_serializer_class
-from baserow.api.subjects.serializers import SubjectOptionSerializer
 from baserow.contrib.agent.actions import (
     CreateAgentConversationActionType,
     CreateAgentMessageActionType,
@@ -49,7 +48,11 @@ from baserow.contrib.agent.signals import agent_loaded
 from baserow.contrib.agent.types import AgentMessageCreated
 from baserow.core.action.registries import action_type_registry
 from baserow.core.chat_runs.exceptions import ChatRunAlreadyActive, ChatRunLimitReached
-from baserow.core.exceptions import ApplicationDoesNotExist, UserNotInWorkspace
+from baserow.core.exceptions import (
+    ApplicationDoesNotExist,
+    UserNotInWorkspace,
+    WorkspaceDoesNotExist,
+)
 from baserow.core.pagination import KeysetCursor
 from baserow.core.service import CoreService
 
@@ -75,8 +78,11 @@ from .serializers import (
     AgentMessageCreateSerializer,
     AgentMessagePagination,
     AgentMessageSerializer,
-    AgentRunAsSubjectsQueryParamsSerializer,
+    AgentPendingReplySerializer,
+    AgentRunAsIdentitiesQueryParamsSerializer,
+    AgentRunAsOptionSerializer,
     AgentToolDecisionsSerializer,
+    AgentToolSerializer,
 )
 
 AGENT_ID_PATH_PARAMETER = OpenApiParameter(
@@ -272,33 +278,69 @@ class AgentConfigurationView(RealtimeRecoveryPrimaryReadMixin, APIView):
         return Response(AgentConfigurationSerializer(configuration).data)
 
 
-class AgentRunAsSubjectsView(RealtimeRecoveryPrimaryReadMixin, APIView):
+class AgentRunAsIdentitiesView(RealtimeRecoveryPrimaryReadMixin, APIView):
     @extend_schema(
-        parameters=[AGENT_ID_PATH_PARAMETER, AgentRunAsSubjectsQueryParamsSerializer],
+        parameters=[AGENT_ID_PATH_PARAMETER, AgentRunAsIdentitiesQueryParamsSerializer],
         tags=["Agent applications"],
-        operation_id="list_agent_run_as_subjects",
+        operation_id="list_agent_run_as_identities",
         description="Lists active workspace identities selectable for this Agent. "
         "Requires permission to read and update its configuration.",
         responses={
-            200: get_example_pagination_serializer_class(SubjectOptionSerializer),
+            200: get_example_pagination_serializer_class(AgentRunAsOptionSerializer),
             **READ_ERRORS,
         },
     )
     @map_exceptions(AGENT_EXCEPTIONS)
     @validate_query_parameters(
-        AgentRunAsSubjectsQueryParamsSerializer, return_validated=True
+        AgentRunAsIdentitiesQueryParamsSerializer, return_validated=True
     )
     def get(self, request: Request, agent_id: int, query_params: dict) -> Response:
         """Return paginated choices authorized in this Agent's application scope."""
 
-        options = AgentService().get_run_as_subject_options(
+        options = AgentService().get_run_as_identities(
             request.user, agent_id, search=query_params["search"]
         )
         paginator = PageNumberPagination(limit_page_size=100)
         page = paginator.paginate_queryset(options, request, view=self)
         return paginator.get_paginated_response(
-            SubjectOptionSerializer(page, many=True).data
+            AgentRunAsOptionSerializer(page, many=True).data
         )
+
+
+class AgentToolsView(APIView):
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name="workspace_id",
+                location=OpenApiParameter.PATH,
+                type=OpenApiTypes.INT,
+                description="The id of the workspace the agent is created in.",
+            )
+        ],
+        tags=["Agent applications"],
+        operation_id="list_workspace_agent_tools",
+        description=(
+            "Lists every tool an agent created in the workspace can be allowed to "
+            "call. Requires permission to create an application in the workspace."
+        ),
+        responses={
+            200: AgentToolSerializer(many=True),
+            400: get_error_schema(["ERROR_USER_NOT_IN_GROUP"]),
+            401: get_error_schema(["ERROR_PERMISSION_DENIED"]),
+            404: get_error_schema(["ERROR_GROUP_DOES_NOT_EXIST"]),
+        },
+    )
+    @map_exceptions(
+        {
+            WorkspaceDoesNotExist: ERROR_GROUP_DOES_NOT_EXIST,
+            UserNotInWorkspace: ERROR_USER_NOT_IN_GROUP,
+        }
+    )
+    def get(self, request: Request, workspace_id: int) -> Response:
+        """Responds with the tools if the user can create an agent."""
+
+        tools = AgentService().get_available_tools(request.user, workspace_id)
+        return Response(AgentToolSerializer(tools, many=True).data)
 
 
 class AgentConversationsView(RealtimeRecoveryPrimaryReadMixin, APIView):
@@ -543,6 +585,42 @@ class AgentMessagesView(RealtimeRecoveryPrimaryReadMixin, APIView):
             AgentMessageCreatedSerializer(
                 result, context=_accepted_context(result)
             ).data
+        )
+
+
+class AgentPendingApprovalsView(RealtimeRecoveryPrimaryReadMixin, APIView):
+    @extend_schema(
+        tags=["Agent applications"],
+        operation_id="list_agent_pending_approvals",
+        description="List pending tool approvals grouped by reply in conversations visible to the current user.",
+        parameters=[
+            AGENT_ID_PATH_PARAMETER,
+            OpenApiParameter("page", OpenApiTypes.INT, default=1),
+            OpenApiParameter(
+                "size",
+                OpenApiTypes.INT,
+                default=100,
+                description="Number of replies per page, up to 100.",
+            ),
+        ],
+        responses={
+            200: get_example_pagination_serializer_class(AgentPendingReplySerializer),
+            **READ_ERRORS,
+        },
+    )
+    @map_exceptions(AGENT_EXCEPTIONS)
+    def get(self, request: Request, agent_id: int) -> Response:
+        paginator = PageNumberPagination(limit_page_size=100)
+        page = paginator.paginate_queryset(
+            AgentService().list_pending_replies(request.user, agent_id), request, self
+        )
+        context = {
+            "conversation_pending_approvals": {
+                reply.conversation_id: len(reply.pending_approvals) for reply in page
+            }
+        }
+        return paginator.get_paginated_response(
+            AgentPendingReplySerializer(page, many=True, context=context).data
         )
 
 

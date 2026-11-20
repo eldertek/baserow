@@ -12,7 +12,7 @@ const requestedTable = (input) =>
   typeof input?.values?.table === 'string' ? input.values.table.trim() : ''
 
 /** Database presenters share count/table formatting; Core knows neither field. */
-class DatabaseToolPresentationType extends ToolPresentationType {
+export class DatabaseToolPresentationType extends ToolPresentationType {
   static getType() {
     return this.definition.type
   }
@@ -195,6 +195,28 @@ export class CreateTablesToolPresentationType extends DatabaseToolPresentationTy
     counted: true,
     table: true,
   }
+
+  getActivityDetails({ status, facts }, t) {
+    if (
+      status !== STEP_STATUS.DONE ||
+      !Number.isSafeInteger(facts.database_id) ||
+      !Array.isArray(facts.created_tables)
+    )
+      return {}
+    const links = facts.created_tables
+      .filter(
+        (table) => Number.isSafeInteger(table?.id) && trimmedName(table.name)
+      )
+      .map((table) => ({
+        label: t('agent.openTable', { table: table.name }),
+        to: {
+          name: 'database-table',
+          params: { databaseId: facts.database_id, tableId: table.id },
+        },
+        id: table.id,
+      }))
+    return { links }
+  }
 }
 
 export class CreateFieldsToolPresentationType extends DatabaseToolPresentationType {
@@ -340,21 +362,135 @@ export class WebSearchToolPresentationType extends ToolPresentationType {
       this.getQueries({ input }).length === 0 && this.getUrl({ input })
         ? 'agent.toolWebSearchOpenPage'
         : 'agent.toolWebSearch'
-    const activity =
+    return status === STEP_STATUS.RUNNING
+      ? t(`${key}Running`)
+      : status === STEP_STATUS.DONE
+        ? t(`${key}Done`)
+        : t(key)
+  }
+
+  getActivityDetails({ input }) {
+    return { description: input.unavailable ? '' : this.getTarget({ input }) }
+  }
+}
+
+/** A page Baserow opens for the model, which works with every provider. */
+export class WebFetchToolPresentationType extends WebSearchToolPresentationType {
+  static getType() {
+    return 'web_fetch'
+  }
+
+  getLabel(t) {
+    return t('agent.toolWebFetch')
+  }
+}
+
+const isEmpty = (value) =>
+  value == null || value === '' || (Array.isArray(value) && !value.length)
+
+/**
+ * How the calls of a configured action look. Its builder names the tool, so
+ * the type is the action's service type instead.
+ */
+export class ActionToolPresentationType extends ToolPresentationType {
+  /** The translation keys of the service's fields, in the order people read them. */
+  get fieldLabels() {
+    return {}
+  }
+
+  /** The resolved values in reading order, without the ones left empty. */
+  getInput({ input }, t) {
+    const values = input.values || {}
+    const labels = this.fieldLabels
+    const keys = [
+      ...Object.keys(labels).filter((key) => key in values),
+      ...Object.keys(values).filter((key) => !(key in labels)),
+    ]
+    return {
+      ...input,
+      values: Object.fromEntries(
+        keys
+          .filter((key) => !isEmpty(values[key]))
+          .map((key) => [labels[key] ? t(labels[key]) : key, values[key]])
+      ),
+    }
+  }
+}
+
+export class SMTPEmailToolPresentationType extends ActionToolPresentationType {
+  static getType() {
+    return 'smtp_email'
+  }
+
+  get fieldLabels() {
+    return {
+      from_email: 'smtpEmailForm.fromEmail',
+      from_name: 'smtpEmailForm.fromName',
+      to_emails: 'smtpEmailForm.toEmails',
+      cc_emails: 'smtpEmailForm.ccEmails',
+      bcc_emails: 'smtpEmailForm.bccEmails',
+      subject: 'smtpEmailForm.subject',
+      body: 'smtpEmailForm.body',
+      body_type: 'smtpEmailForm.bodyType',
+      integration_id: 'smtpEmailForm.integrationDropdownLabel',
+      use_instance_smtp_settings: 'smtpEmailForm.smtpConfigurationMode',
+    }
+  }
+
+  getLabel(t) {
+    return t('agent.toolSendEmail')
+  }
+
+  getActivity({ status }, t) {
+    return t(
       status === STEP_STATUS.RUNNING
-        ? t(`${key}Running`)
+        ? 'agent.toolSendEmailRunning'
         : status === STEP_STATUS.DONE
-          ? t(`${key}Done`)
-          : t(key)
-    const target = this.getTarget({ input })
-    return target
-      ? t('agent.toolWebSearchTarget', { activity, target })
-      : activity
+          ? 'agent.toolSendEmailDone'
+          : 'agent.toolSendEmail'
+    )
+  }
+}
+
+export class HTTPRequestToolPresentationType extends ActionToolPresentationType {
+  static getType() {
+    return 'http_request'
+  }
+
+  get fieldLabels() {
+    return {
+      http_method: 'coreHTTPRequestServiceForm.httpMethod',
+      url: 'coreHTTPRequestServiceForm.url',
+      query_params: 'coreHTTPRequestServiceForm.queryParams',
+      headers: 'coreHTTPRequestServiceForm.headers',
+      body_type: 'coreHTTPRequestServiceForm.bodyType',
+      body_content: 'coreHTTPRequestServiceForm.bodyContent',
+      form_data: 'coreHTTPRequestServiceForm.formData',
+      timeout: 'coreHTTPRequestServiceForm.timeout',
+      inputs: 'agent.actionInputs',
+    }
+  }
+
+  getLabel(t) {
+    return t('agent.toolHTTPRequest')
+  }
+
+  getActivity({ status }, t) {
+    return t(
+      status === STEP_STATUS.RUNNING
+        ? 'agent.toolHTTPRequestRunning'
+        : status === STEP_STATUS.DONE
+          ? 'agent.toolHTTPRequestDone'
+          : 'agent.toolHTTPRequest'
+    )
   }
 }
 
 export const agentToolPresentationTypes = [
+  SMTPEmailToolPresentationType,
+  HTTPRequestToolPresentationType,
   WebSearchToolPresentationType,
+  WebFetchToolPresentationType,
   ListDatabasesToolPresentationType,
   ListTablesToolPresentationType,
   GetTableSchemaToolPresentationType,

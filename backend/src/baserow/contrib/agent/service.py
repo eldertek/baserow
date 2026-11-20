@@ -2,17 +2,22 @@ from uuid import UUID
 
 from django.contrib.auth.models import AbstractUser
 from django.db import DEFAULT_DB_ALIAS, transaction
-from django.db.models import QuerySet
+from django.db.models import F, QuerySet
 
 from baserow.core.exceptions import PermissionDenied
-from baserow.core.feature_flags import FF_AGENT_BUILDER, feature_flag_is_enabled
 from baserow.core.handler import CoreHandler
-from baserow.core.operations import UpdateApplicationOperationType
+from baserow.core.identities.handler import IdentityHandler
+from baserow.core.identities.service import IdentityService
+from baserow.core.operations import (
+    CreateApplicationsWorkspaceOperationType,
+    UpdateApplicationOperationType,
+)
 from baserow.core.signals import application_pending_count_updated, application_updated
-from baserow.core.subject_options import SubjectOptionsHandler
 from baserow.core.types import PermissionCheck
 
-from .constants import RUN_AS_SUBJECT_TYPES, AgentReadinessState
+from .action_tools.handler import AgentActionHandler
+from .action_tools.signals import agent_action_updated
+from .constants import AgentReadinessState
 from .exceptions import (
     AgentConversationReadOnly,
     AgentConversationWaitingForApproval,
@@ -29,6 +34,7 @@ from .operations import (
     ReadAgentConversationsOperationType,
     UpdateAgentConversationOperationType,
 )
+from .registries import agent_tool_type_registry
 from .signals import (
     agent_conversation_activity,
     agent_conversation_deleted,
@@ -95,7 +101,30 @@ class AgentService:
         )
         return self.handler.get_configuration(agent)
 
-    def get_run_as_subject_options(
+    def get_available_tools(self, user: AbstractUser, workspace_id: int) -> list[dict]:
+        """
+        List the tools an Agent created in the workspace can be allowed to call.
+
+        :param user: The user about to create an Agent.
+        :param workspace_id: The id of the workspace the Agent is created in.
+        :raises WorkspaceDoesNotExist: When the workspace doesn't exist.
+        :raises PermissionException: When the user may not create an application in
+            the workspace.
+        :return: Each tool an Agent can be given.
+        """
+
+        workspace = CoreHandler().get_workspace(workspace_id)
+        CoreHandler().check_permissions(
+            user,
+            CreateApplicationsWorkspaceOperationType.type,
+            workspace=workspace,
+            context=workspace,
+        )
+        return self.handler.get_available_tools(
+            self.handler.get_deactivated_tools(workspace)
+        )
+
+    def get_run_as_identities(
         self, user: AbstractUser, agent_id: int, search: str = ""
     ) -> QuerySet:
         """
@@ -105,7 +134,8 @@ class AgentService:
         :param agent_id: The Agent whose configuration is being edited.
         :param search: The optional identity-name search.
         :raises PermissionException: When the user may not read and update the Agent.
-        :return: Active identity options from the Agent's authoritative workspace.
+        :return: Active identity options from the Agent's authoritative workspace,
+            none when the user may not bind identities.
         """
 
         agent = self.get_authorized_agent(
@@ -114,11 +144,14 @@ class AgentService:
             UpdateApplicationOperationType.type,
             ReadAgentConfigurationOperationType.type,
         )
-        return SubjectOptionsHandler.get_options(
-            workspace=agent.workspace,
-            search=search,
-            subject_types=set(RUN_AS_SUBJECT_TYPES),
-        )
+        identities = IdentityHandler().get_queryset(agent.workspace, for_selection=True)
+        if not IdentityService().check_can_bind(
+            user, agent.workspace, raise_permission_exceptions=False
+        ):
+            identities = identities.none()
+        if search := search.strip():
+            identities = identities.filter(first_name__icontains=search)
+        return identities.values("id", name=F("first_name"))
 
     @transaction.atomic
     def update_configuration(
@@ -131,9 +164,12 @@ class AgentService:
         :param agent_id: The id of the Agent.
         :param values: The configuration values to set, by field name.
         :raises PermissionException: When the user may not update the Agent or read
-            its configuration.
+            its configuration, or may not bind it to a different identity.
         :raises AgentRunAsSubjectDoesNotExist: When the Agent can't act as the
             given subject.
+        :raises rest_framework.exceptions.PermissionDenied: When an allowed tool is
+            deactivated in the Agent's workspace, unless its type raises its own
+            error.
         :return: The Agent, its original and new configuration values, and the
             resolved resulting configuration.
         """
@@ -145,6 +181,12 @@ class AgentService:
             ReadAgentConfigurationOperationType.type,
             for_update=True,
         )
+        run_as = [values.get(field) for field in self.handler.run_as_fields]
+        current_run_as = [getattr(agent, field) for field in self.handler.run_as_fields]
+        if any(run_as) and run_as != current_run_as:
+            IdentityService().check_can_bind(user, agent.workspace)
+        for name in values.get("allowed_tools") or []:
+            agent_tool_type_registry.get(name).raise_if_deactivated(agent.workspace)
         updated = self.handler.update_configuration(agent, **values)
         if updated.original_values != updated.new_values:
             # Open pages refresh readiness from this public application payload.
@@ -178,6 +220,15 @@ class AgentService:
         )
         return self.handler.list_conversations(
             agent, user, cursor, pinned, has_pending_approvals
+        )
+
+    def list_pending_replies(
+        self, user: AbstractUser, agent_id: int
+    ) -> QuerySet[AgentMessage]:
+        """Replies with undecided tool calls in conversations visible to this user."""
+
+        return self.handler.list_pending_replies(
+            self.list_conversations(user, agent_id)
         )
 
     def list_messages(
@@ -482,13 +533,11 @@ class AgentService:
         :raises AgentMessageConflict: When the uuid was accepted with another first
             message.
         :raises AgentNotReady: When the agent isn't ready for a new conversation.
-        :raises ChatRunLimitReached: When the workspace has its maximum of replies
-            running.
+        :raises ChatRunLimitReached: When a reply limit is reached.
         :return: The conversation, its first message and its reply, and whether they
             are new.
         """
 
-        feature_flag_is_enabled(FF_AGENT_BUILDER, raise_if_disabled=True)
         agent = self.get_authorized_agent(
             user,
             agent_id,
@@ -542,13 +591,11 @@ class AgentService:
         :raises AgentNotReady: When the agent isn't ready for a new message.
         :raises ChatRunAlreadyActive: When the agent is still replying in this
             conversation.
-        :raises ChatRunLimitReached: When the workspace has its maximum of replies
-            running.
+        :raises ChatRunLimitReached: When a reply limit is reached.
         :return: The conversation, the message and its reply, and whether the message
             is new.
         """
 
-        feature_flag_is_enabled(FF_AGENT_BUILDER, raise_if_disabled=True)
         agent = self.get_authorized_agent(
             user, agent_id, CreateAgentMessageOperationType.type
         )
@@ -603,14 +650,12 @@ class AgentService:
         :raises AgentToolApprovalNotPending: When an approval is decided already or
             isn't held by the reply waiting in the conversation.
         :raises AgentNotReady: When the agent isn't ready to continue the reply.
-        :raises ChatRunLimitReached: When the workspace has its maximum of replies
-            running.
+        :raises ChatRunLimitReached: When a reply limit is reached.
         :return: The reply with its approvals, the run continuing it or None while
             some held calls are still undecided, and the tools that stopped asking
             first.
         """
 
-        feature_flag_is_enabled(FF_AGENT_BUILDER, raise_if_disabled=True)
         operations = [CreateAgentMessageOperationType.type]
         if always_allow:
             operations += [
@@ -636,9 +681,7 @@ class AgentService:
             if approval.status == AgentToolApproval.Status.REJECTED
         ]
         always_allowed_tools = (
-            self._stop_asking_first(user, agent_id, approved_tools)
-            if always_allow
-            else []
+            self._stop_asking_first(user, agent_id, decided) if always_allow else []
         )
         application_pending_count_updated.send(
             self, application=agent, user_ids=conversation.pending_count_user_ids
@@ -655,21 +698,38 @@ class AgentService:
         )
 
     def _stop_asking_first(
-        self, user: AbstractUser, agent_id: int, tool_names: list[str]
+        self,
+        user: AbstractUser,
+        agent_id: int,
+        approvals: list[AgentToolApproval],
     ) -> list[str]:
         """
-        Stop asking first for the given tools, telling the Agent's open pages when
-        its configuration changed.
+        Stop asking first for the tools of the approved calls, telling the Agent's
+        open pages when its configuration changed. An action only stops asking
+        while it's still the one whose call was approved.
 
         :param user: The user deciding, already allowed to update the configuration.
         :param agent_id: The id of the Agent.
-        :param tool_names: The tools of the approved calls.
+        :param approvals: The decisions saved in this request.
         :return: The tools that stopped asking first.
         """
 
+        approved = {
+            approval.tool_name: approval.tool_key
+            for approval in approvals
+            if approval.status == AgentToolApproval.Status.APPROVED
+        }
         # Locked after the conversation, as trashing it needs the Agent row too.
         agent = self.handler.get_agent(agent_id, for_update=True)
-        stopped = self.handler.stop_asking_first(agent, tool_names)
+        stopped = self.handler.stop_asking_first(agent, list(approved))
         if stopped:
             application_updated.send(self, application=agent, user=user)
+        for tool in self.handler.get_action_tools(agent):
+            if tool.ask_first and approved.get(tool.type) == tool.approval_key:
+                updated = AgentActionHandler().update_action(
+                    tool.action, ask_first=False
+                )
+                # No session edited the action, so the approver's own is told too.
+                agent_action_updated.send(self, action=updated.action, user=None)
+                stopped.append(tool.type)
         return stopped

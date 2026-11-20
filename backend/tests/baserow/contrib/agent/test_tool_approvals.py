@@ -17,7 +17,7 @@ from baserow.contrib.agent.models import (
 from baserow.core.action.registries import action_type_registry
 from baserow.core.chat_runs.handler import ChatRunHandler
 from baserow.core.chat_runs.models import ChatRun, ChatRunStatus
-from baserow.core.models import Agent
+from baserow.core.identities.handler import IdentityHandler
 from baserow.core.signals import application_updated
 
 from .utils import agent_url, new_conversation
@@ -272,7 +272,33 @@ def test_pending_approvals_are_counted_per_agent_and_per_conversation(
         str(waiting.uuid): 2,
         str(idle.uuid): 0,
     }
+    pending = api_client.get(agent_url(agent, "pending_approvals")).json()
+    assert pending["count"] == 1
+    entry = pending["results"][0]
+    assert entry["uuid"] == str(held_reply.uuid)
+    assert entry["conversation"]["uuid"] == str(waiting.uuid)
+    assert [item["tool"] for item in entry["approvals"]] == [
+        "create_rows",
+        "update_rows",
+    ]
     assert renamed.json()["pending_approval_count"] == 2
+
+    trigger = data_fixture.create_agent_trigger(agent=agent, name="Morning")
+    shared = data_fixture.create_agent_conversation(
+        agent=agent, owner_user=None, trigger=trigger
+    )
+    data_fixture.create_agent_tool_approval(conversation=shared)
+    pending_url = agent_url(agent, "pending_approvals")
+    first = api_client.get(pending_url, {"size": 1}).json()
+    assert first["count"] == 2
+    shared_data = first["results"][0]["conversation"]
+    assert shared_data["uuid"] == str(shared.uuid)
+    assert shared_data["shared"] is True
+    assert shared_data["trigger_name"] == "Morning"
+    assert shared_data["pending_approval_count"] == 1
+    assert api_client.get(pending_url, {"size": 1, "page": 2}).json()["results"] == [
+        entry
+    ]
 
 
 @pytest.mark.django_db
@@ -315,8 +341,10 @@ def test_always_allow_stops_asking_first_only_for_approved_tools_that_ask_first(
     api_client, api_user, data_fixture, held_reply, mocker
 ):
     agent = held_reply.conversation.agent
-    identity = Agent.objects.create(workspace=agent.workspace, name="Investor")
-    agent.run_as_subject_type, agent.run_as_subject_id = "core.Agent", identity.id
+    identity = IdentityHandler().create_identity(
+        workspace=agent.workspace, name="Investor"
+    )
+    agent.run_as_subject_type, agent.run_as_subject_id = "auth.User", identity.id
     agent.save()
     for tool_name in ("delete_rows", "list_tables"):
         data_fixture.create_agent_tool_approval(reply=held_reply, tool_name=tool_name)

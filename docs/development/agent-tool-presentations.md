@@ -27,8 +27,11 @@ The backend emits `step` events and saves the same steps on the assistant messag
 }
 ```
 
-- `tool` is the tool's name. Frontend presenters are registered under it. They
-  only describe calls and never select what runs or what is allowed.
+- `tool` is the callable tool's name. Configured actions also set
+  `presentation_type` to their stable service type, such as `smtp_email`, because
+  their callable names are editable. Frontend presenters resolve
+  `presentation_type || tool`. They only describe calls and never select what
+  runs or what is allowed.
 - `status` is `running`, `waiting`, `done`, `failed`, `rejected`, `stopped` or
   `skipped`, see `STEP_STATUS` in `modules/core/chatRuns/constants.js`. Calls
   held for approval are `waiting` from their call event, including changes that
@@ -47,8 +50,10 @@ The backend emits `step` events and saves the same steps on the assistant messag
   runs, before the tool changes anything; see
   [Readable requests](#readable-requests).
 - `facts` are confirmed after an authorized success: a count, and the names of
-  created or read tables. A requested count doesn't prove how many items
-  changed. A batch that partly fails is `done` with the count the tool reports.
+  created or read tables. Successful table creation also records the database ID
+  and each created table's ID and name so the card can link to the table.
+  A requested count doesn't prove how many items changed. A batch that partly
+  fails is `done` with the count the tool reports.
 - `error_code` is set on failed steps: `not_found`, `permission_denied`,
   `invalid_input`, `invalid_formula`, `conflict`, `failed` or `not_run`, for a
   held call that ended without running. For an exception
@@ -94,7 +99,24 @@ failed steps too.
   written.
 - Reads of one table name only the table, so a held read shows what it reads.
 
-The card shows `values` as indented JSON, collapsed by default.
+Tool details start collapsed. Objects with keys are shown as a two-column table.
+Nested objects, arrays and other JSON values retain their JSON formatting.
+
+### Configured actions
+
+An action type resolves the action's formulas once with the call's arguments and
+sends their readable projection through the same `ToolCallInputEvent`. The preview
+includes fixed configuration as well as model-supplied values: email recipients,
+sender, subject, body, and body format, for example. Action types explicitly allow
+readable fields; integration credentials never enter the preview. Service export
+redaction is a separate policy: an email body is sensitive in an external export
+but must be visible to the person approving its delivery.
+
+An action's preview isn't bounded as above: its action type decides how to limit
+what a call may send and what its preview shows. The values are stored as JSON,
+which doesn't keep their order, so the action's presenter orders and labels
+them. See [One call](./agent-actions.md#one-call) for how the shown values are
+the ones sent.
 
 ## Web search
 
@@ -107,6 +129,21 @@ was meant to search but couldn't, because the provider refused the tool, gets on
 failed step whose `input` is `{"unavailable": true}`. A search is never held for
 approval, even next to a held call. A resumed reply offers search only if its
 paused run did, so a provider that refused it isn't asked again.
+
+## Opening web pages
+
+When "Open web pages" is on, Baserow downloads pages itself, so every model can
+use it. It is a function tool named `web_fetch` with no `AgentToolType`, and its
+step looks like a page web search opened: `input` holds only the `url`. The tool
+refuses a URL the step can't record in full, so the step always names the page
+that was requested. It downloads through the same outbound HTTP stack as the HTTP
+request integration (address checks on every redirect, the response size ceiling
+and one deadline), opens only text pages, and stops after a few pages per reply.
+Internal addresses are refused even where integrations may reach them, because
+the model picks the URL.
+A failure comes back as a tool error with a message instead of a retry, so broken
+links don't use up the reply's retries. Opening a page is never held for approval.
+A resumed reply offers it only if its paused run did and the setting is still on.
 
 ## Adding a tool
 

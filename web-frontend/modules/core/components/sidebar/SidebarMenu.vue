@@ -160,7 +160,10 @@
 
 <script>
 import { mapGetters } from 'vuex'
-import { getWorkspaceMembersCount } from '@baserow/modules/core/utils/workspace'
+import {
+  canListIdentities,
+  getWorkspaceMembersCount,
+} from '@baserow/modules/core/utils/workspace'
 
 import TrashModal from '@baserow/modules/core/components/trash/TrashModal'
 import NotificationPanel from '@baserow/modules/core/components/NotificationPanel'
@@ -193,17 +196,15 @@ export default {
     membersCount() {
       return getWorkspaceMembersCount(
         this.selectedWorkspace,
-        this.$hasPermission(
-          'workspace.list_agents',
-          this.selectedWorkspace,
-          this.selectedWorkspace.id
-        )
+        canListIdentities(this, this.selectedWorkspace)
       )
     },
     isManagementPage() {
-      return ['settings-members', 'settings-teams', 'settings-agents'].includes(
-        this.$route.name
-      )
+      return [
+        'settings-members',
+        'settings-teams',
+        'settings-identities',
+      ].includes(this.$route.name)
     },
     sidebarWorkspaceComponents() {
       return Object.values(this.$registry.getAll('plugin'))

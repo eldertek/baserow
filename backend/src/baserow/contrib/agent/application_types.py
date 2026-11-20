@@ -6,6 +6,8 @@ from django.db import transaction
 from django.db.transaction import Atomic
 from django.urls import URLResolver, include, path
 
+from baserow.contrib.agent.action_tools.handler import AgentActionHandler
+from baserow.contrib.agent.action_tools.registries import agent_action_type_registry
 from baserow.contrib.agent.api.serializers import AgentApplicationSerializer
 from baserow.contrib.agent.constants import AgentRunAsState
 from baserow.contrib.agent.handler import AgentHandler
@@ -20,10 +22,10 @@ from baserow.contrib.agent.registries import (
 )
 from baserow.contrib.agent.triggers.handler import AgentTriggerHandler
 from baserow.core.ai_provider.constants import AI_PROVIDER_FEATURE_AI_AGENT
-from baserow.core.feature_flags import FF_AGENT_BUILDER, feature_flag_is_enabled
 from baserow.core.generative_ai.constants import ReasoningEffort
 from baserow.core.generative_ai.registries import generative_ai_model_type_registry
 from baserow.core.handler import CoreHandler
+from baserow.core.identities.service import IdentityService
 from baserow.core.integrations.handler import IntegrationHandler
 from baserow.core.integrations.models import Integration
 from baserow.core.integrations.operations import ReadIntegrationOperationType
@@ -63,7 +65,8 @@ class AgentApplicationType(ApplicationType):
         import_export_config: ImportExportConfig,
     ) -> tuple[str | None, int | None]:
         """
-        Keep existing identity references in internal copies of their workspace.
+        Keep existing identity references in internal copies of their workspace,
+        when the person copying or restoring may bind identities.
 
         A trashed identity remains configured so restoring it also restores access
         for the copy. Execution still requires an active identity.
@@ -84,21 +87,26 @@ class AgentApplicationType(ApplicationType):
             return None, None
         if workspace is None:
             return run_as
+        if not IdentityService().can_copy_binding(workspace, import_export_config):
+            return None, None
         resolution = AgentHandler().resolve_run_as_subject(*run_as, workspace)
         if resolution.status in {AgentRunAsState.ACTIVE, AgentRunAsState.TRASHED}:
             return run_as
         return None, None
 
     def supports_integration_type(self, integration_type) -> bool:
-        """Only MCP servers: an Agent uses no other integration."""
+        """MCP servers, and the integrations its action types' services use."""
 
         from baserow.contrib.integrations.mcp.integration_types import (
             MCPServerIntegrationType,
         )
 
-        return (
-            super().supports_integration_type(integration_type)
-            and integration_type.type == MCPServerIntegrationType.type
+        return super().supports_integration_type(integration_type) and (
+            integration_type.type == MCPServerIntegrationType.type
+            or any(
+                action_type.service_type.integration_type == integration_type.type
+                for action_type in agent_action_type_registry.get_all()
+            )
         )
 
     def get_api_urls(self) -> list[URLResolver]:
@@ -151,7 +159,6 @@ class AgentApplicationType(ApplicationType):
         init_with_data: bool = False,
         **kwargs,
     ) -> AgentApplication:
-        feature_flag_is_enabled(FF_AGENT_BUILDER, raise_if_disabled=True)
         models = generative_ai_model_type_registry.get_enabled_models_per_type(
             workspace, feature_type=AI_PROVIDER_FEATURE_AI_AGENT
         )
@@ -214,7 +221,7 @@ class AgentApplicationType(ApplicationType):
             provider_type=application.provider_type,
             model_identifier=application.model_identifier,
             reasoning_effort=application.reasoning_effort,
-            **AgentHandler().get_tool_configuration(application),
+            **AgentHandler().get_stored_tool_configuration(application),
             integrations=[
                 IntegrationHandler().export_integration(
                     integration,
@@ -227,6 +234,10 @@ class AgentApplicationType(ApplicationType):
                 )
             ],
             web_search_enabled=application.web_search_enabled,
+            web_fetch_enabled=application.web_fetch_enabled,
+            actions=AgentActionHandler().export_actions(
+                application, import_export_config, files_zip, storage
+            ),
             triggers=AgentTriggerHandler().export_triggers(
                 application, import_export_config, files_zip, storage
             ),
@@ -292,11 +303,16 @@ class AgentApplicationType(ApplicationType):
         application.run_as_subject_type, application.run_as_subject_id = (
             self._imported_run_as(workspace, serialized_values, import_export_config)
         )
-        # Searching is paid and sends data out, so outside copies must opt in again.
-        application.web_search_enabled = (
-            import_export_config.is_duplicate
-            and not import_export_config.is_template
-            and serialized_values.get("web_search_enabled", False)
+        # Searching is paid, and both send data out, so outside copies must opt in
+        # again.
+        internal_copy = (
+            import_export_config.is_duplicate and not import_export_config.is_template
+        )
+        application.web_search_enabled = internal_copy and serialized_values.get(
+            "web_search_enabled", False
+        )
+        application.web_fetch_enabled = internal_copy and serialized_values.get(
+            "web_fetch_enabled", False
         )
         application.save()
         registered = agent_tool_type_registry.get_types()
@@ -327,6 +343,14 @@ class AgentApplicationType(ApplicationType):
                 storage=storage,
                 import_export_config=import_export_config,
             )
+        AgentActionHandler().import_actions(
+            application,
+            serialized_values.get("actions", []),
+            id_mapping,
+            import_export_config,
+            files_zip,
+            storage,
+        )
         AgentTriggerHandler().import_triggers(
             application,
             serialized_values.get("triggers", []),

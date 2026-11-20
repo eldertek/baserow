@@ -50,6 +50,7 @@ from .serializers import (
     AdminApproveUserTemplateSerializer,
     AdminBlockUserTemplateSerializer,
     AdminRejectUserTemplateSerializer,
+    AdminUnblockUserTemplateSerializer,
     AdminUserTemplateCountsSerializer,
     AdminUserTemplateSerializer,
     AdminUserTemplatesQueryParamsSerializer,
@@ -86,12 +87,18 @@ REVIEW_EXCEPTIONS = {
     TemplateNotReviewable: ERROR_TEMPLATE_NOT_REVIEWABLE,
     TemplateHasNoContent: ERROR_TEMPLATE_HAS_NO_CONTENT,
 }
+BLOCK_ERRORS = ["ERROR_REQUEST_BODY_VALIDATION", "ERROR_TEMPLATE_UPDATED"]
 MODERATE_RESPONSES = {
     200: AdminUserTemplateSerializer,
+    400: get_error_schema(BLOCK_ERRORS),
     401: None,
     404: get_error_schema(["ERROR_TEMPLATE_DOES_NOT_EXIST"]),
 }
-MODERATE_EXCEPTIONS = {TemplateDoesNotExist: ERROR_TEMPLATE_DOES_NOT_EXIST}
+MODERATE_EXCEPTIONS = {
+    TemplateDoesNotExist: ERROR_TEMPLATE_DOES_NOT_EXIST,
+    TemplateUpdated: ERROR_TEMPLATE_UPDATED,
+    TemplateHasNoContent: ERROR_TEMPLATE_HAS_NO_CONTENT,
+}
 
 
 def serialize_admin_row(revision: Template) -> Dict[str, Any]:
@@ -122,6 +129,7 @@ class AdminUserTemplatesView(AdminListingView):
         "author": "author_name",
         "updated_on": "template_updated_on",
         "used": "template_install_count",
+        "private_link": "template_private_link",
         "submitted": "submitted_on",
     }
     sort_tie_breakers = ("-id",)
@@ -181,11 +189,11 @@ class AdminUserTemplatesView(AdminListingView):
     @extend_schema(
         tags=["Admin"],
         operation_id="admin_list_user_templates",
-        description="Returns the user templates in review, public, rejected or "
-        "blocked, if the requesting user is staff: the revision under review of a "
-        "template in review or rejected, the public revision of a public one, "
-        "otherwise its latest revision. The templates can be searched by name and "
-        "by the name or email of the author.",
+        description="Returns the user templates in review, public, rejected, "
+        "blocked or private, if the requesting user is staff: the revision under "
+        "review of a template in review or rejected, the public revision of a public "
+        "one, otherwise its latest revision. The templates can be searched by name "
+        "and by the name or email of the author.",
         **AdminListingView.get_extend_schema_parameters(
             "templates",
             serializer_class,
@@ -228,7 +236,7 @@ class AdminUserTemplateCountsView(APIView):
         tags=["Admin"],
         operation_id="admin_count_user_templates",
         description="Returns how many user templates are in review, public, "
-        "rejected and blocked, if the requesting user is staff.",
+        "rejected, blocked and private, if the requesting user is staff.",
         responses={200: AdminUserTemplateCountsSerializer, 401: None},
     )
     def get(self, request: Request) -> Response:
@@ -325,14 +333,12 @@ class AdminBlockUserTemplateView(APIView):
         "staff. Only its author and instance admins can open it, only instance "
         "admins can install or download it, its private link stops working, and "
         "its author sees the reason and can't change its visibility or private "
-        "link. Nothing else changes. Blocking a blocked template changes the "
-        "reason.",
+        "link. Nothing else changes. The revision the admin saw must be one of "
+        "the template's, and of a blocked template still its latest one. Blocking "
+        "a blocked template changes the reason and resets when it was blocked.",
         parameters=[TEMPLATE_ID_PATH_PARAMETER],
         request=AdminBlockUserTemplateSerializer,
-        responses={
-            **MODERATE_RESPONSES,
-            400: get_error_schema(["ERROR_REQUEST_BODY_VALIDATION"]),
-        },
+        responses=MODERATE_RESPONSES,
     )
     @map_exceptions(MODERATE_EXCEPTIONS)
     @validate_body(AdminBlockUserTemplateSerializer, return_validated=True)
@@ -344,7 +350,7 @@ class AdminBlockUserTemplateView(APIView):
 
         revision = action_type_registry.get_by_type(
             BlockUserTemplateAdminActionType
-        ).do(request.user, int(template_id), data["reason"])
+        ).do(request.user, int(template_id), data["revision_id"], data["reason"])
         return Response(serialize_admin_row(revision))
 
 
@@ -355,19 +361,28 @@ class AdminUnblockUserTemplateView(APIView):
         tags=["Admin"],
         operation_id="admin_unblock_user_template",
         description="Lifts the block of a user template, if the requesting user is "
-        "staff. The template is private afterwards, with its private link working "
-        "again, and its author can make it public again. Unblocking a template "
-        "that isn't blocked changes nothing.",
+        "staff, which restores the state it had before the block, its private link "
+        "included. When it was listed, its latest revision is listed, approved by "
+        "the admin, unless an admin rejected it. When approval isn't required, "
+        "a pending revision of a template without an open rejection is approved. "
+        "The revision the admin saw must still be its latest one. Unblocking a "
+        "template that isn't blocked changes nothing.",
         parameters=[TEMPLATE_ID_PATH_PARAMETER],
-        request=None,
-        responses=MODERATE_RESPONSES,
+        request=AdminUnblockUserTemplateSerializer,
+        responses={
+            **MODERATE_RESPONSES,
+            400: get_error_schema([*BLOCK_ERRORS, "ERROR_TEMPLATE_HAS_NO_CONTENT"]),
+        },
     )
     @map_exceptions(MODERATE_EXCEPTIONS)
+    @validate_body(AdminUnblockUserTemplateSerializer, return_validated=True)
     @transaction.atomic
-    def post(self, request: Request, template_id: str) -> Response:
-        """Unblocks the template and responds with its row."""
+    def post(
+        self, request: Request, data: Dict[str, Any], template_id: str
+    ) -> Response:
+        """Unblocks the template and responds with its row in its tab now."""
 
         revision = action_type_registry.get_by_type(
             UnblockUserTemplateAdminActionType
-        ).do(request.user, int(template_id))
+        ).do(request.user, int(template_id), data["revision_id"])
         return Response(serialize_admin_row(revision))

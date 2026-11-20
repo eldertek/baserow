@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
+import { UserSubjectType } from '@baserow/modules/core/subjectTypes'
 import {
   agentData,
   choose,
@@ -85,6 +86,28 @@ describe('Agent configuration', () => {
 
     expect(wrapper.find('.agent-trigger-card form').exists()).toBe(true)
     expect(wrapper.element.querySelectorAll('form form')).toHaveLength(0)
+  })
+
+  test('offers configured action types from the configuration API', async () => {
+    mockConfiguration(
+      testApp,
+      completeConfiguration({ available_action_types: ['smtp_email'] })
+    )
+    testApp.mock.onGet('application/10/integrations/').reply(200, [])
+    testApp.mock.onGet('/agent/10/actions/').reply(200, [])
+    const wrapper = await mount()
+    await openSection(wrapper, 'agent.actions')
+    await flushPromises()
+
+    const add = wrapper.get('.agent-actions__header button')
+    expect(add.text()).toBe('agent.addAction')
+    await add.trigger('click')
+    await flushPromises()
+    expect(
+      wrapper
+        .findAll('.grouped-menu__actions .menu-list__item-button')
+        .map((item) => item.text())
+    ).toEqual([expect.stringContaining('serviceType.coreSMTPEmail')])
   })
 
   test('keeps the open form when the Agent changes in the background', async () => {
@@ -604,8 +627,12 @@ describe('Agent configuration', () => {
     mockConfiguration(testApp, incompleteConfiguration('model_identifier'))
     const wrapper = await mount()
 
-    const [instructionsSection, , , , settingsSection] = wrapper.findAll(
-      '.menu-list__item-button'
+    const sections = wrapper.findAll('.menu-list__item-button')
+    const instructionsSection = sections.find((section) =>
+      section.text().includes('agent.instructions')
+    )
+    const settingsSection = sections.find((section) =>
+      section.text().includes('agent.agentSettings')
     )
 
     expect(instructionsSection.find('.icon--error').exists()).toBe(false)
@@ -615,18 +642,21 @@ describe('Agent configuration', () => {
   })
 
   test('runs as a chosen identity or with no workspace access', async () => {
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    vi.spyOn(
+      UserSubjectType.prototype,
+      'identityIconClass',
+      'get'
+    ).mockReturnValue('iconoir-identity-test')
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_id: 7,
-          subject_type: 'core.Agent',
+          id: 7,
           name: 'Investor',
         },
       ])
     )
-    const investor = { type: 'core.Agent', id: 7, name: 'Investor' }
+    const investor = { type: 'auth.User', id: 7, name: 'Investor' }
     mockSaves(
       testApp,
       completeConfiguration({ run_as: { ...investor, trashed: false } }),
@@ -635,29 +665,30 @@ describe('Agent configuration', () => {
     const wrapper = await mount()
     await openSection(wrapper, 'agent.workspaceAccess')
     const body = () => wrapper.get('.agent-configuration__body')
-    const select = async (name) => {
+    const select = async (name, expectedIcon) => {
       await body().get('.dropdown__selected').trigger('click')
       await flushPromises()
-      await body()
+      const item = body()
         .findAll('.select__item-link')
         .find((item) => item.text().includes(name))
-        .trigger('click')
+      expect(item.get('.select__item-icon').classes()).toContain(expectedIcon)
+      await item.trigger('click')
       await flushPromises()
     }
 
-    await select('Investor')
+    await select('Investor', 'iconoir-identity-test')
     expect(body().text()).toContain('agent.runAsHelper')
-    await select('agent.noWorkspaceAccess')
+    await select('agent.noWorkspaceAccess', 'iconoir-prohibition')
 
     expect(savedValues(testApp)).toEqual([
-      { run_as_subject_type: 'core.Agent', run_as_subject_id: 7 },
+      { run_as_subject_type: 'auth.User', run_as_subject_id: 7 },
       { run_as_subject_type: null, run_as_subject_id: null },
     ])
     expect(body().text()).toContain('agent.noWorkspaceAccessHelper')
   })
 
   const investor = {
-    type: 'core.Agent',
+    type: 'auth.User',
     id: 7,
     name: 'Investor',
     trashed: false,
@@ -730,25 +761,31 @@ describe('Agent configuration', () => {
       { ...investor, id: 8, name: 'Support' },
       'Support',
     ],
+    [
+      'an identity with the same ID as an unavailable subject',
+      investor,
+      'Investor',
+      { ...investor, type: 'unknown.subject', status: 'missing' },
+    ],
     ['no workspace access', null, 'agent.noWorkspaceAccess'],
   ])(
     'clears the workspace access error after choosing %s',
-    async (_, identity, label) => {
+    async (
+      _,
+      identity,
+      label,
+      unavailableIdentity = { ...investor, trashed: true }
+    ) => {
       mockConfiguration(
         testApp,
-        completeConfiguration({ run_as: { ...investor, trashed: true } })
+        completeConfiguration({ run_as: unavailableIdentity })
       )
-      testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
-        200,
-        page([
-          {
-            id: 'core.Agent:8',
-            subject_id: 8,
-            subject_type: 'core.Agent',
-            name: 'Support',
-          },
-        ])
-      )
+      testApp.mock
+        .onGet('/agent/10/run-as-identities/')
+        .reply(
+          200,
+          page(identity ? [{ id: identity.id, name: identity.name }] : [])
+        )
       mockSaves(testApp, completeConfiguration({ run_as: identity }))
       const wrapper = await mount()
       expect(workspaceAccessRow(wrapper).find('.icon--error').exists()).toBe(
@@ -757,7 +794,9 @@ describe('Agent configuration', () => {
 
       await openSection(wrapper, 'agent.workspaceAccess')
       expect(wrapper.get('.control__messages').text()).toContain(
-        'agent.runAsTrashed'
+        unavailableIdentity.status === 'missing'
+          ? 'agent.runAsMissing'
+          : 'agent.runAsTrashed'
       )
       await wrapper
         .get('.agent-configuration .dropdown__selected')
@@ -785,7 +824,7 @@ describe('Agent configuration', () => {
   test('shows a missing identity distinctly and can clear it directly', async () => {
     const missing = { ...investor, name: null, status: 'missing' }
     mockConfiguration(testApp, completeConfiguration({ run_as: missing }))
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(200, page([]))
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(200, page([]))
     mockSaves(testApp, completeConfiguration({ run_as: null }))
     const wrapper = await mount()
     expect(
@@ -810,7 +849,7 @@ describe('Agent configuration', () => {
 
   test('does not fetch identities for a readonly field and revalidates after edit permission is granted', async () => {
     allowed.value = (operation) => operation !== 'application.update'
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(200, page([]))
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(200, page([]))
     const wrapper = await mount()
     await openSection(wrapper, 'agent.workspaceAccess')
     await wrapper
@@ -819,7 +858,7 @@ describe('Agent configuration', () => {
     await flushPromises()
     const requests = () =>
       testApp.mock.history.get.filter(({ url }) =>
-        url.includes('/run-as-subjects/')
+        url.includes('/run-as-identities/')
       )
     expect(requests()).toHaveLength(0)
     allowed.value = () => true
@@ -851,7 +890,7 @@ describe('Agent configuration', () => {
         agentIds.push(id)
       }
       mockConfiguration(testApp, completeConfiguration({ run_as: investor }))
-      testApp.mock.onGet('/agent/10/run-as-subjects/').reply(200, page([]))
+      testApp.mock.onGet('/agent/10/run-as-identities/').reply(200, page([]))
       const wrapper = await mount()
       await openSection(wrapper, 'agent.workspaceAccess')
       await wrapper
@@ -866,8 +905,8 @@ describe('Agent configuration', () => {
 
       expect(testApp.mock.history.get.map(({ url }) => url).sort()).toEqual(
         selected
-          ? ['/agent/10/configuration/', '/agent/10/run-as-subjects/']
-          : ['/agent/10/run-as-subjects/']
+          ? ['/agent/10/configuration/', '/agent/10/run-as-identities/']
+          : ['/agent/10/run-as-identities/']
       )
     }
   )
@@ -876,19 +915,17 @@ describe('Agent configuration', () => {
     useFakeTimers()
     const subjects = () =>
       testApp.mock.history.get.filter(({ url }) =>
-        url.includes('/run-as-subjects/')
+        url.includes('/run-as-identities/')
       )
     const configurations = () =>
       testApp.mock.history.get.filter(({ url }) =>
         url.includes('/configuration/')
       )
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_type: 'core.Agent',
-          subject_id: 7,
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -905,13 +942,11 @@ describe('Agent configuration', () => {
     search.element.focus()
     const configCount = configurations().length
     const subjectCount = subjects().length
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:8',
-          subject_type: 'core.Agent',
-          subject_id: 8,
+          id: 8,
           name: 'Investor replacement',
         },
       ])
@@ -967,13 +1002,11 @@ describe('Agent configuration', () => {
   test('rejects only the unavailable choice and saves other pending edits', async () => {
     testApp.dontFailOnErrorResponses()
     const patch = deferredReply()
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_type: 'core.Agent',
-          subject_id: 7,
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -998,7 +1031,7 @@ describe('Agent configuration', () => {
     expect(savedValues(testApp)).toEqual([
       {
         instructions: 'Keep my draft',
-        run_as_subject_type: 'core.Agent',
+        run_as_subject_type: 'auth.User',
         run_as_subject_id: 7,
       },
       { instructions: 'Keep my draft' },
@@ -1016,19 +1049,15 @@ describe('Agent configuration', () => {
     testApp.dontFailOnErrorResponses()
     const patch = deferredReply()
     const support = { ...investor, id: 8, name: 'Support', status: 'active' }
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_type: 'core.Agent',
-          subject_id: 7,
+          id: 7,
           name: 'Investor',
         },
         {
-          id: 'core.Agent:8',
-          subject_type: 'core.Agent',
-          subject_id: 8,
+          id: 8,
           name: 'Support',
         },
       ])
@@ -1046,8 +1075,8 @@ describe('Agent configuration', () => {
     patch.resolve(400, { error: 'ERROR_AGENT_RUN_AS_SUBJECT_DOES_NOT_EXIST' })
     await flushPromises()
     expect(savedValues(testApp)).toEqual([
-      { run_as_subject_type: 'core.Agent', run_as_subject_id: 7 },
-      { run_as_subject_type: 'core.Agent', run_as_subject_id: 8 },
+      { run_as_subject_type: 'auth.User', run_as_subject_id: 7 },
+      { run_as_subject_type: 'auth.User', run_as_subject_id: 8 },
     ])
     expect(
       wrapper.get('.agent-configuration .dropdown__selected-text').text()
@@ -1057,13 +1086,11 @@ describe('Agent configuration', () => {
 
   test('keeps an identity draft on a network failure so it can be retried', async () => {
     testApp.dontFailOnErrorResponses()
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_type: 'core.Agent',
-          subject_id: 7,
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -1084,7 +1111,7 @@ describe('Agent configuration', () => {
       .trigger('click')
     await flushPromises()
     expect(savedValues(testApp)).toEqual(
-      Array(2).fill({ run_as_subject_type: 'core.Agent', run_as_subject_id: 7 })
+      Array(2).fill({ run_as_subject_type: 'auth.User', run_as_subject_id: 7 })
     )
     expect(wrapper.find('.agent-configuration__save-status').exists()).toBe(
       false
@@ -1110,13 +1137,11 @@ describe('Agent configuration', () => {
 
   test('keeps rejected-choice recovery failures separate from dirty edits', async () => {
     testApp.dontFailOnErrorResponses()
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_type: 'core.Agent',
-          subject_id: 7,
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -1179,7 +1204,7 @@ describe('Agent configuration', () => {
     'refreshes the run-as label when another editor %s',
     async (_, previous, next, expectedLabel) => {
       useFakeTimers()
-      testApp.mock.onGet('/agent/10/run-as-subjects/').reply(200, page([]))
+      testApp.mock.onGet('/agent/10/run-as-identities/').reply(200, page([]))
       mockConfiguration(testApp, completeConfiguration({ run_as: previous }))
       const wrapper = await mount()
       await openSection(wrapper, 'agent.workspaceAccess')
@@ -1209,7 +1234,8 @@ describe('Agent configuration', () => {
   )
 
   describe('web search', () => {
-    const setting = (wrapper) => wrapper.get('.agent-web-search')
+    const setting = (wrapper) =>
+      wrapper.findComponent({ name: 'AgentWebSearchSetting' })
     const webSearch = (extra = {}) =>
       completeConfiguration({
         web_search_enabled: false,
@@ -1244,7 +1270,7 @@ describe('Agent configuration', () => {
       expect(input.props('disabled')).toBe(true)
       expect(input.props('modelValue')).toBe(false)
       expect(
-        setting(wrapper).get('.agent-web-search__unavailable').text()
+        setting(wrapper).get('.agent-web-setting__unavailable').text()
       ).toBe('agent.webSearchUnavailable')
     })
 
@@ -1264,7 +1290,7 @@ describe('Agent configuration', () => {
       const input = setting(wrapper).findComponent({ name: 'SwitchInput' })
       expect(input.props('disabled')).toBe(true)
       expect(
-        setting(wrapper).get('.agent-web-search__unavailable').text()
+        setting(wrapper).get('.agent-web-setting__unavailable').text()
       ).toBe('agent.webSearchBlockedByTools')
     })
 
@@ -1286,7 +1312,7 @@ describe('Agent configuration', () => {
         await openSection(wrapper, 'agent.agentSettings')
 
         expect(
-          setting(wrapper).find('.agent-web-search__unavailable').exists()
+          setting(wrapper).find('.agent-web-setting__unavailable').exists()
         ).toBe(false)
         expect(setting(wrapper).findComponent({ name: 'Badge' }).exists()).toBe(
           false
@@ -1313,10 +1339,10 @@ describe('Agent configuration', () => {
         'agent.webSearchUnavailableBadge'
       )
       expect(
-        setting(wrapper).get('.agent-web-search__unavailable').classes()
+        setting(wrapper).get('.agent-web-setting__unavailable').classes()
       ).toContain('alert--warning')
       expect(
-        setting(wrapper).get('.agent-web-search__unavailable').text()
+        setting(wrapper).get('.agent-web-setting__unavailable').text()
       ).toBe('agent.webSearchUnavailableWhileOn')
 
       expect(input.props('modelValue')).toBe(true)
@@ -1353,6 +1379,35 @@ describe('Agent configuration', () => {
         expect(setting(wrapper).find('.alert').exists()).toBe(warned)
       }
     )
+  })
+
+  describe('opening web pages', () => {
+    const setting = (wrapper) =>
+      wrapper.findComponent({ name: 'AgentWebFetchSetting' })
+    const webFetch = (extra = {}) =>
+      completeConfiguration({ web_fetch_enabled: false, ...extra })
+
+    test('is off by default, saves when turned on and then warns', async () => {
+      mockConfiguration(testApp, webFetch())
+      mockSaves(testApp, webFetch({ web_fetch_enabled: true }))
+      const wrapper = await mount()
+      await openSection(wrapper, 'agent.agentSettings')
+
+      const input = setting(wrapper).findComponent({ name: 'SwitchInput' })
+      expect(input.props('modelValue')).toBe(false)
+      expect(setting(wrapper).find('.alert').exists()).toBe(false)
+
+      input.vm.$emit('update:modelValue', true)
+      await flushPromises()
+
+      expect(savedValues(testApp)).toEqual([{ web_fetch_enabled: true }])
+      expect(input.props('modelValue')).toBe(true)
+      // Even without workspace tools the conversation and trigger data can leak
+      // through the URLs it opens.
+      expect(setting(wrapper).get('.alert').text()).toBe(
+        'agent.webFetchWarning'
+      )
+    })
   })
 
   const withTools = (
@@ -1448,6 +1503,51 @@ describe('Agent configuration', () => {
       ])
     }
   )
+
+  test('locks a tool the workspace cannot use and explains why instead of allowing it', async () => {
+    const show = vi.fn()
+    const LockedModal = { methods: { show }, render: () => null }
+    vi.spyOn(
+      testApp.getRegistry().get('toolPresentation', 'delete_rows'),
+      'getDeactivatedClickModal'
+    ).mockReturnValue([LockedModal, {}])
+    const configuration = withTools(['list_tables', 'create_rows'])
+    configuration.available_tools.find(
+      ({ name }) => name === 'delete_rows'
+    ).deactivated = true
+    configuration.available_tools.push({
+      name: 'locked_without_modal',
+      group: 'database',
+      changes_data: true,
+      deactivated: true,
+    })
+    mockConfiguration(testApp, configuration)
+    const wrapper = await mount()
+    await openSection(wrapper, 'agent.workspaceAccess')
+    const tools = wrapper.get('.agent-workspace-tools')
+
+    // Every tool the workspace can use is allowed, so the preset is Everything.
+    expect(tools.get('.segment-control__button--active').text()).toBe(
+      'agent.toolsEverything'
+    )
+    await tools.get('button.agent-workspace-tools__group').trigger('click')
+    await flushPromises()
+    const lock = (tool) =>
+      inModal('.agent-tool-permissions__tool', tool).querySelector(
+        '.agent-tool-permissions__locked'
+      )
+    expect(lock('agent.toolCreateRows')).toBeNull()
+    // A lock stands where the tool would be allowed and asked first.
+    expect(toolInput('agent.toolDeleteRows', 'allow')).toBeNull()
+    expect(toolInput('agent.toolDeleteRows', 'ask-first')).toBeNull()
+    expect(lock('agent.toolDeleteRows').tagName).toBe('BUTTON')
+    expect(lock('locked_without_modal').tagName).toBe('I')
+
+    lock('agent.toolDeleteRows').click()
+    await flushPromises()
+
+    expect(show).toHaveBeenCalledTimes(1)
+  })
 
   test('enables database listing and asks before newly allowed database changes', async () => {
     const availableTools = [
@@ -1564,7 +1664,10 @@ describe('Agent configuration', () => {
 
   test('keeps workspace tool controls inactive for a read-only member', async () => {
     allowed.value = (operation) => operation !== 'application.update'
-    mockConfiguration(testApp, withTools(['list_tables', 'create_rows']))
+    mockConfiguration(
+      testApp,
+      withTools(['list_tables', 'create_rows', 'delete_rows'])
+    )
     const wrapper = await mount()
     await openSection(wrapper, 'agent.workspaceAccess')
     const tools = wrapper.get('.agent-workspace-tools')
@@ -1587,7 +1690,7 @@ describe('Agent configuration', () => {
   })
 
   test('clears workspace tools when no workspace access is selected', async () => {
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(200, page([]))
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(200, page([]))
     mockConfiguration(testApp, withTools(['list_tables', 'create_rows']))
     mockSaves(testApp, withTools([], { runAs: null }))
     const wrapper = await mount()
@@ -1620,13 +1723,11 @@ describe('Agent configuration', () => {
 
   test('requires an identity before tools can be enabled and keeps them off after selection', async () => {
     mockConfiguration(testApp, withTools([], { runAs: null }))
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_id: 7,
-          subject_type: 'core.Agent',
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -1659,20 +1760,18 @@ describe('Agent configuration', () => {
       'agent.workspaceToolsDescription'
     )
     expect(savedValues(testApp)).toEqual([
-      { run_as_subject_type: 'core.Agent', run_as_subject_id: 7 },
+      { run_as_subject_type: 'auth.User', run_as_subject_id: 7 },
     ])
   })
 
   test('keeps explicit tool activation while the identity selection is still saving', async () => {
     const patch = deferredReply()
     mockConfiguration(testApp, withTools([], { runAs: null }))
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_id: 7,
-          subject_type: 'core.Agent',
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -1689,7 +1788,7 @@ describe('Agent configuration', () => {
     await flushPromises()
     expect(toggle.attributes('aria-checked')).toBe('true')
     expect(savedValues(testApp)).toEqual([
-      { run_as_subject_type: 'core.Agent', run_as_subject_id: 7 },
+      { run_as_subject_type: 'auth.User', run_as_subject_id: 7 },
     ])
 
     patch.resolve(200, withTools([]))
@@ -1697,7 +1796,7 @@ describe('Agent configuration', () => {
 
     expect(toggle.attributes('aria-checked')).toBe('true')
     expect(savedValues(testApp)).toEqual([
-      { run_as_subject_type: 'core.Agent', run_as_subject_id: 7 },
+      { run_as_subject_type: 'auth.User', run_as_subject_id: 7 },
       { allowed_tools: ['list_tables'], ask_first_tools: [] },
     ])
   })
@@ -1707,13 +1806,11 @@ describe('Agent configuration', () => {
       testApp,
       withTools(['list_tables', 'create_rows'], { runAs: null })
     )
-    testApp.mock.onGet('/agent/10/run-as-subjects/').reply(
+    testApp.mock.onGet('/agent/10/run-as-identities/').reply(
       200,
       page([
         {
-          id: 'core.Agent:7',
-          subject_id: 7,
-          subject_type: 'core.Agent',
+          id: 7,
           name: 'Investor',
         },
       ])
@@ -1734,7 +1831,7 @@ describe('Agent configuration', () => {
     )
     expect(savedValues(testApp)).toEqual([
       {
-        run_as_subject_type: 'core.Agent',
+        run_as_subject_type: 'auth.User',
         run_as_subject_id: 7,
         allowed_tools: [],
         ask_first_tools: [],
@@ -2008,22 +2105,19 @@ describe('Agent configuration', () => {
     ])
   })
 
-  test('locks the ask switch while no change tool is allowed', async () => {
-    mockConfiguration(testApp, withTools(['list_tables']))
-    const wrapper = await mount()
-    await openSection(wrapper, 'agent.workspaceAccess')
-    const ask = askSwitch(wrapper)
-    expect(ask.attributes('aria-checked')).toBe('false')
-    expect(ask.attributes('aria-disabled')).toBe('true')
-    expect(ask.element.tabIndex).toBe(-1)
+  test.each([
+    ['read only', ['list_tables']],
+    ['custom', ['list_tables', 'create_rows']],
+  ])(
+    'hides the ask switch outside the Everything preset (%s)',
+    async (_, allowedTools) => {
+      mockConfiguration(testApp, withTools(allowedTools))
+      const wrapper = await mount()
+      await openSection(wrapper, 'agent.workspaceAccess')
 
-    await ask.trigger('click')
-    await ask.trigger('keydown', { key: 'Enter' })
-    await flushPromises()
-
-    expect(groupCount(wrapper)).toBe('agent.toolsSummary')
-    expect(savedValues(testApp)).toEqual([])
-  })
+      expect(wrapper.find('.agent-workspace-tools__ask').exists()).toBe(false)
+    }
+  )
 
   test('renames the Agent through the application with the trimmed name', async () => {
     mockRename(testApp, { ...agentData, name: 'Support' })
@@ -2159,7 +2253,7 @@ describe('Agent configuration', () => {
       .trigger('click')
     await flushPromises()
 
-    expect(wrapper.findAll('.menu-list__item-button')).toHaveLength(5)
+    expect(wrapper.findAll('.menu-list__item-button')).toHaveLength(6)
   })
 
   test('warns when model availability cannot be loaded until retry', async () => {

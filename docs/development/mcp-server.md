@@ -22,7 +22,7 @@ ActionTypes → Django ORM
 - **MCPTool** (`registries.py`) — Base class for all tools. Subclasses define a `type`, a Pydantic `input_schema`, and implement `_sync_call()`. Tools with `enabled = False` are registered but hidden from MCP clients.
 - **Services layer** (`services.py`) — Workspace-scoped database operations. Shared by both MCP tools and the enterprise AI assistant.
 - **Shared tools** (`baserow/core/tools/`, `baserow/contrib/database/tools/`) — Tool functions that MCP, Kuma and the Agent Builder all call. A shared tool takes a `ToolContext` (user, workspace, status callback) plus arguments annotated with `Annotated[..., Field(description=...)]`, and knows nothing about the client. `FunctionMCPTool` builds its MCP input schema from the signature and its description from the docstring; MCP-only metadata (title, group, read-only) is set where it is registered, for example `contrib/database/mcp/views/tools.py`. Kuma wraps the same function in its own tool, which adds Kuma's argument (`thought`) and guidance.
-- **Action types** — All mutations go through Baserow's action-type layer, so operations are audit-logged. Kuma's writes can be undone; writes over MCP can't, see the note on builder tools below.
+- **Action types** — All mutations go through Baserow's action-type layer, so operations are audit-logged. Kuma's writes can be undone, and so can writes over MCP with the `undo` tool, see the note on undo below.
 - **Workspace isolation** — Every service function enforces workspace-scoped access. Tools cannot touch data outside the endpoint's workspace.
 - **SSE transport** (`backend/src/baserow/core/mcp/sse.py`) — `DjangoChannelsSseServerTransport` serves the legacy `GET /mcp/{key}/sse` stream and `POST /mcp/messages/`.
 - **OAuth** (`backend/src/baserow/core/mcp/oauth/`) — Authorization server, client registration and token views for `POST /mcp`. The consent and connected-apps APIs used by the frontend are in `backend/src/baserow/api/mcp/oauth_views.py`.
@@ -31,10 +31,10 @@ ActionTypes → Django ORM
 
 An `MCPEndpoint` links a user to one workspace and to the tools they allowed (`allowed_tools`, a list of tool names). Tools added later stay off until the user turns them on. Endpoints created before tool lists existed were given the original database tools in `LEGACY_DEFAULT_TOOLS`, and a null list still means that list. There are two kinds:
 
-- **OAuth grants**: created when a client signs in through the consent page (see [OAuth sign-in](#oauth-sign-in)). The client calls `POST /mcp` with an access token. They are listed, and can be disconnected, on the **OAuth** tab of **My settings > MCP server**.
-- **Endpoint keys**: a 32-character secret key, created under **My settings > MCP server** (on the **Endpoint** tab when OAuth is on). A new key gets every read-only tool plus the `LEGACY_DEFAULT_TOOLS`. Its tools can be changed with `PATCH` on the endpoint, like an OAuth connection's. Older clients use it in the SSE URL, `GET /mcp/{key}/sse`. `POST /mcp` also accepts it as `Authorization: Bearer <key>`.
+- **OAuth grants**: created when a client signs in through the consent page (see [OAuth sign-in](#oauth-sign-in)). The client calls `POST /mcp` with an access token. They are listed on the **OAuth** tab of **My settings > MCP server**, where **Edit tools** changes a connection's tools without a new sign-in and **Disconnect** revokes it. A client sees the change the next time it lists its tools, usually in a new session. A connection marked expired has to sign in again either way.
+- **Endpoint keys**: a 32-character secret key, created under **My settings > MCP server** (on the **Endpoint** tab when OAuth is on). A new key gets every read-only tool plus the `LEGACY_DEFAULT_TOOLS`. It has no **Edit tools** button; its tools can only be changed with `PATCH` on the endpoint. Older clients use it in the SSE URL, `GET /mcp/{key}/sse`. `POST /mcp` also accepts it as `Authorization: Bearer <key>`.
 
-Users install the client side, the MCP server config plus skills, from [baserow/baserow-mcp](https://github.com/baserow/baserow-mcp). Its README has the install steps for each agent, the [MCP server user docs](https://baserow.io/user-docs/mcp-server) cover the hosted apps such as Claude and ChatGPT, and **My settings > MCP server** shows copy-ready setup with the instance's own URL.
+Users install the client side, the MCP server config plus skills, from [baserow/baserow-mcp](https://github.com/baserow/baserow-mcp). Its skills follow the tool areas: `baserow-basics` (rows, errors, undo, missing tools), `baserow-databases`, `baserow-automations`, `baserow-dashboards`, `baserow-app-builder` and `baserow-workspace` (search, row comments, audit log). When a tool's name, group or behaviour changes, check whether the matching skill there needs the same change. Its README has the install steps for each agent, the [MCP server user docs](https://baserow.io/user-docs/mcp-server) cover the hosted apps such as Claude and ChatGPT, and **My settings > MCP server** shows copy-ready setup with the instance's own URL.
 
 ## Running the server
 
@@ -90,7 +90,7 @@ claude mcp add --transport http baserow http://localhost:8000/mcp
 
 `ALLOW_LOCALHOST_LOOPBACK` is already on in the settings, so clients can use `http://localhost` redirect URIs.
 
-See the [test plan](../testing/mcp-test-plan.md#1-connect-an-mcp-client) for other clients, the plugin and the skill.
+See the [test plan](../testing/mcp-test-plan.md#1-connect-an-mcp-client) for other clients, the plugin and the skills.
 
 ### ChatGPT app domain verification
 
@@ -103,6 +103,8 @@ OpenAI verifies the domain of a submitted ChatGPT app by fetching `/.well-known/
 | Tool | Group | On for a new key | Destructive | Description |
 |---|---|---|---|---|
 | `search_workspace` | `workspace_read` | on | no | Search the workspace by name or content, optionally by type (shared with Kuma) |
+| `undo` | `workspace_undo` | off | yes | Undo the latest change made through the same endpoint, everything one tool call changed at once |
+| `redo` | `workspace_undo` | off | yes | Redo the latest change undone with `undo` |
 | `list_databases` | `database_read` | on | no | List all databases in the workspace (kept for existing connections, until 2.6) |
 | `list_applications` | `database_read` | on | no | List the workspace's databases, a page at a time (shared with Kuma) |
 | `list_tables` | `database_read` | on | no | List tables, optionally filtered by database or table name (shared with Kuma) |
@@ -110,6 +112,7 @@ OpenAI verifies the domain of a submitted ChatGPT app by fetching `/.well-known/
 | `list_table_rows` | `database_read` | on | no | List rows with optional search and pagination |
 | `list_views` | `database_read` | on | no | List the views of a table (shared with Kuma) |
 | `list_row_comments` | `database_read` | on | no | List a row's comments as plain text. Needs premium (shared with Kuma) |
+| `search_row_comments` | `database_read` | on | no | Find the comments of a database, newest first, by table, mentioned user, author and date. Needs premium |
 | `create_rows` | `database_edit` | on | no | Create one or more rows using field names |
 | `update_rows` | `database_edit` | on | yes | Update rows by ID using field names |
 | `create_database` | `database_edit` | off | no | Create one database (shared with Kuma) |
@@ -185,27 +188,30 @@ list_databases
             └─ delete_rows(table_id, [1, 2])
 ```
 
-The automation tools are in their own groups (`automation_read`, `automation_edit`, `automation_delete`) and are not part of the "Read only" preset, so a user turns them on at consent or later under Settings. A value that takes a formula is stored as written when it is a valid formula and quoted when it is a literal. A formula is invalid when it doesn't parse, or reads a `previous_node` path the node doesn't output (the paths `list_nodes` shows). An invalid formula comes back in `formula_errors` for the client to fix with `update_nodes`: on a new node the value is left empty, on an update it keeps what it had. A formula can name a node created earlier in the same call by its ref, as in `get('previous_node.trigger.0.id')`. Over MCP no model is called; Kuma repairs those values with its formula generator after the nodes are committed.
+The automation tools are in their own groups (`automation_read`, `automation_edit`, `automation_delete`) and are not part of the "Read only" preset, so a user turns them on at consent or later with **Edit tools**. A value that takes a formula is stored as written when it is a valid formula and quoted when it is a literal. A formula is invalid when it doesn't parse, or reads a `previous_node` path the node doesn't output (the paths `list_nodes` shows). An invalid formula comes back in `formula_errors` for the client to fix with `update_nodes`: on a new node the value is left empty, on an update it keeps what it had. A formula can name a node created earlier in the same call by its ref, as in `get('previous_node.trigger.0.id')`. Over MCP no model is called; Kuma repairs those values with its formula generator after the nodes are committed.
 
 The dashboard tools are in the `dashboard_read`, `dashboard_edit` and `dashboard_delete` groups. `dashboard_read` is part of the "Read only" preset, because it only returns figures the user can already see on the dashboard. A widget is a `summary` (one field aggregated over the rows), a `chart` or a `pie_chart` (one or more series, optionally grouped by a field). Charts need a premium licence; without one the widget fails with the licence message. Each widget is saved on its own, so one that fails is listed in `errors` and the others are kept. An aggregation that doesn't fit a field, like `sum` on a text field, comes back in `errors` with the aggregations that do. A widget filters its rows through a view (`view_id`); filters on the data source itself are not offered. New widgets go where the dashboard places them by default.
 
-The application tools `create_database`, `create_automation`, `create_dashboard` and `create_builder` create one application each, and the four `update_` tools rename one. They sit in the edit group of their area (`database_edit`, `automation_edit`, `dashboard_edit`, `builder_edit`). `create_dashboard` replaces `create_dashboards`. Endpoints store tool names, so an endpoint that stored `create_dashboards` loses that tool and has to turn on `create_dashboard` under **Settings > Connected apps**.
+The application tools `create_database`, `create_automation`, `create_dashboard` and `create_builder` create one application each, and the four `update_` tools rename one. They sit in the edit group of their area (`database_edit`, `automation_edit`, `dashboard_edit`, `builder_edit`). `create_dashboard` replaces `create_dashboards`. Endpoints store tool names, so an endpoint that stored `create_dashboards` loses that tool and has to turn on `create_dashboard`: an OAuth connection with **Edit tools** next to the app under **My settings > MCP server**, an endpoint key with `PATCH` on the endpoint.
 
 `create_workflows` makes draft workflows, which do nothing. `publish_workflow` makes one live and is destructive, because it replaces the live copy and starts real effects such as sent emails and written rows; the client should ask the user first. `pause_workflow` stops a live workflow, and publishing again makes it live with the current draft. It is destructive too, because events while a workflow is paused are never run. `move_elements` is destructive because it changes where existing elements are.
 
 The application builder tools are registered by the builder app (`baserow.contrib.builder.mcp`) and need no licence. `setup_user_source` and the `auth_form` element need enterprise code, so `setup_user_source` is registered by the enterprise app, and an instance running with `BASEROW_OSS_ONLY` has the other builder tools without it; there, creating an `auth_form` is refused. They are in the `builder_read`, `builder_edit` and `builder_delete` groups. `builder_read` is part of the "Read only" preset. `builder_delete` holds `delete_element_items`, which deletes table columns and menu items with their click actions. Over MCP `update_element` can't remove them; Kuma's `update_element` still can. There is no tool for deleting an application, a page or an element. The shared code is in `baserow/contrib/builder/tools/`, with login in `baserow_enterprise/builder/tools/`, and an MCP tool never offers the Kuma-only parameters (`known_refs`, `known_data_source_refs`, `column_name_beats_description`, `defer_required_formulas`). A formula that is not valid comes back in `formula_errors` for the client to fix with the matching `update_` tool, and no model is called. A table column's formula is the exception: a new or changed one that is not valid refuses the whole `update_element`. When `update_element` changes the text of a button that also shows a notification, the result has a `note` naming that action, which stays as it was. The action tools say `element_action` because an action in the automation tools is a workflow node. Kuma uses the same names, and also has `add_element_action_field_mapping`, which MCP leaves out because `update_element_action` sets one field value and keeps the others. `set_theme`, `update_builder`, `update_page`, `update_data_source`, `update_element`, `update_element_style` and `update_element_action` are destructive (as is `delete_element_items`), because each overwrites stored values: `set_theme` replaces every theme setting, `update_element_action` also clears an action's field values when it moves to another table, and the rest replace the values they're given. `update_database`, `update_automation` and `update_dashboard` are destructive for the same reason, like `update_table`.
 
-Writes over MCP can't be undone from Baserow's undo (Ctrl+Z). The action is stored without a client session id, and undo only finds actions made with the same session id as the browser, so nothing in the UI reaches it. To take back a create, delete the application, which moves it to the trash.
+Every tool call runs with the undo session `mcp-<endpoint id>`, the same for each request because Streamable HTTP keeps no connection, and with a new action group, so the `undo` tool takes back everything one call changed. It only finds changes made through the same endpoint key or OAuth grant, never the browser's, and every client and chat on that key or grant shares one undo history: Ctrl+Z in Baserow doesn't undo MCP writes, and `undo` doesn't undo changes made in the web app. The undo API (`/api/user/undo/`) reaches them too when it's sent the `ClientSessionId: mcp-<endpoint id>` header by the endpoint's user. It undoes at most `MAX_UNDOABLE_ACTIONS_PER_ACTION_GROUP` actions of a call per request, and it doesn't wait for or hold back the endpoint's running MCP calls.
+
+Nothing holds back the endpoint's other calls while `undo` or `redo` runs. When one of them changes data during an `undo`, the `undo` stops there and leaves the rest of the call undone only in part; the next `undo` takes back that newer change first and the one after finishes the call. A change that lands just as the `undo` moves on to the next part is taken back by that same `undo`, which then stops. When part of a call couldn't be undone, `undo` refuses to go on into the rest of that call while `redo` can still restore it; one `redo` then restores the whole call. Once another change was made through the endpoint, `redo` can't restore it and `undo` goes on with the older parts.
 
 The audit log tools are in their own group (`audit_log_read`), registered by the enterprise app. They are off in the "Read only" preset and on new endpoint keys (`off_by_default`), so a user has to turn them on. They only read the audit log of the endpoint's workspace, not the instance-wide log.
 
 ## Adding a new tool
 
-1. Create a class extending `MCPTool` in the appropriate `mcp/*/tools.py` file.
-2. Define a Pydantic model for the input and assign it to `input_schema`.
-3. Implement `_sync_call(self, endpoint, args)`.
-4. Register it in `backend/src/baserow/contrib/database/apps.py`.
-5. Add tests in `backend/tests/baserow/contrib/database/mcp/`.
+1. Write the tool as a shared function in the `tools/` package of the app that owns it, for example `baserow/contrib/database/tools/`, so Kuma and the Agent Builder can use it too (see [Shared tools](#architecture)).
+2. Add a `FunctionMCPTool` subclass in the app's `mcp/*/tools.py` with `function` set to it, plus `type`, `title`, `group` and `read_only`. Its input schema comes from the function's signature and its description from the docstring.
+3. Only for an MCP-only tool, extend `MCPTool` instead, assign a Pydantic model to `input_schema` and implement `_sync_call(self, endpoint, args)`.
+4. Register it with `mcp_tool_registry` in the `ready()` of the app that owns it, for example `backend/src/baserow/contrib/database/apps.py`.
+5. Add tests next to the other tools of that app, for example in `backend/tests/baserow/contrib/database/mcp/`.
+6. Add it to the tools table above, to the table in [section 3 of the test plan](../testing/mcp-test-plan.md#3-available-tools), and to the matching skill in [baserow/baserow-mcp](https://github.com/baserow/baserow-mcp).
 
 Set `enabled = False` on the class if the tool should not be exposed to MCP clients yet.
 
